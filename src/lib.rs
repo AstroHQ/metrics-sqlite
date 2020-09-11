@@ -16,7 +16,7 @@ use thiserror::Error;
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
-pub enum VitalsError {
+pub enum MetricsError {
     /// Error with database
     #[error("Database error: {0}")]
     DbConnectionError(#[from] diesel::ConnectionError),
@@ -31,11 +31,13 @@ pub enum VitalsError {
     InvalidDatabasePath,
 }
 /// Vitals result type
-pub type Result<T, E = VitalsError> = std::result::Result<T, E>;
+pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
+mod metrics_db;
 mod models;
 mod schema;
-pub use models::NewMetric;
+pub use metrics_db::MetricsDb;
+pub use models::{Metric, NewMetric};
 
 embed_migrations!("migrations");
 
@@ -43,7 +45,7 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     let url = path
         .as_ref()
         .to_str()
-        .ok_or(VitalsError::InvalidDatabasePath)?;
+        .ok_or(MetricsError::InvalidDatabasePath)?;
     let db = SqliteConnection::establish(url)?;
     embedded_migrations::run(&db)?;
 

@@ -7,3 +7,11 @@ pub struct NewMetric {
     pub key: String,
     pub value: i64,
 }
+
+#[derive(Queryable, Debug)]
+pub struct Metric {
+    pub id: i64,
+    pub timestamp: f64,
+    pub key: String,
+    pub value: i64,
+}
