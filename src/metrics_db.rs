@@ -2,6 +2,9 @@
 use super::{models::Metric, setup_db, Result};
 use diesel::prelude::*;
 use std::path::Path;
+use std::time::Duration;
+
+const SESSION_TIME_GAP_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Calculated metric type from deriv_metrics_for_key()
 #[derive(Debug)]
@@ -10,16 +13,60 @@ pub struct DerivMetric {
     pub key: String,
     pub value: f64,
 }
+/// Describes a session, which is a sub-set of metrics data based on time gaps
+pub struct Session {
+    pub start_time: f64,
+    pub end_time: f64,
+    pub duration: Duration,
+}
+impl Session {
+    pub fn new(start_time: f64, end_time: f64) -> Self {
+        Session {
+            start_time,
+            end_time,
+            duration: Duration::from_secs_f64(end_time - start_time),
+        }
+    }
+}
 /// Metrics database, useful for querying stored metrics
 pub struct MetricsDb {
     db: SqliteConnection,
+    sessions: Vec<Session>,
 }
 
 impl MetricsDb {
     /// Creates a new metrics DB with given path of a SQLite database
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = setup_db(path)?;
-        Ok(MetricsDb { db })
+        let sessions = Self::process_sessions(&db)?;
+        Ok(MetricsDb { db, sessions })
+    }
+
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    fn process_sessions(db: &SqliteConnection) -> Result<Vec<Session>> {
+        use crate::schema::metrics::dsl::*;
+        let timestamps = metrics
+            .select(timestamp)
+            .order(timestamp.asc())
+            .load::<f64>(db)?;
+        let mut sessions: Vec<Session> = Vec::new();
+        let mut current_start = timestamps[0];
+        for pair in timestamps.windows(2) {
+            if pair[1] - pair[0] > SESSION_TIME_GAP_THRESHOLD.as_secs_f64() {
+                sessions.push(Session::new(current_start, pair[0]));
+                current_start = pair[1];
+            }
+        }
+        if let Some(last) = timestamps.last() {
+            if current_start < *last {
+                sessions.push(Session::new(current_start, *last));
+            }
+        }
+
+        Ok(sessions)
     }
 
     /// Returns list of metrics keys stored in the database
@@ -30,20 +77,32 @@ impl MetricsDb {
     }
 
     /// Returns all metrics for given key in ascending timestamp order
-    pub fn metrics_for_key(&self, key_name: &str) -> Result<Vec<Metric>> {
+    pub fn metrics_for_key(
+        &self,
+        key_name: &str,
+        session: Option<&Session>,
+    ) -> Result<Vec<Metric>> {
         use crate::schema::metrics::dsl::*;
-        let r = metrics
-            .order(timestamp.asc())
-            .filter(key.eq(key_name))
-            .load::<Metric>(&self.db)?;
+        let query = metrics.order(timestamp.asc()).filter(key.eq(key_name));
+        let r = match session {
+            Some(session) => query
+                .filter(timestamp.ge(session.start_time))
+                .filter(timestamp.le(session.end_time))
+                .load::<Metric>(&self.db)?,
+            None => query.load::<Metric>(&self.db)?,
+        };
         Ok(r)
     }
 
     /// Returns rate of change, the derivative, of the given metrics key's values
     ///
     /// f(t) = (x(t + 1) - x(t)) / ((t+1) - (t)
-    pub fn deriv_metrics_for_key(&self, key_name: &str) -> Result<Vec<DerivMetric>> {
-        let m = self.metrics_for_key(key_name)?;
+    pub fn deriv_metrics_for_key(
+        &self,
+        key_name: &str,
+        session: Option<&Session>,
+    ) -> Result<Vec<DerivMetric>> {
+        let m = self.metrics_for_key(key_name, session)?;
         let new_values: Vec<_> = m
             .windows(2)
             .map(|v| {
