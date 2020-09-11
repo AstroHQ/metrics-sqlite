@@ -36,7 +36,7 @@ pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 mod metrics_db;
 mod models;
 mod schema;
-pub use metrics_db::MetricsDb;
+pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, NewMetric};
 
 embed_migrations!("migrations");
