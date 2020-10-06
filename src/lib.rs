@@ -1,3 +1,6 @@
+#![deny(missing_docs)]
+//! # Metrics SQLite backend
+
 #[macro_use]
 extern crate diesel;
 #[macro_use]

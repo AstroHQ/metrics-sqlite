@@ -4,6 +4,7 @@ use diesel::prelude::*;
 use std::path::Path;
 use std::time::Duration;
 
+/// Threshold to separate samples into sessions by
 const SESSION_TIME_GAP_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Calculated metric type from deriv_metrics_for_key()
@@ -15,11 +16,15 @@ pub struct DerivMetric {
 }
 /// Describes a session, which is a sub-set of metrics data based on time gaps
 pub struct Session {
+    /// Timestamp session starts at
     pub start_time: f64,
+    /// Timestamp session ends at
     pub end_time: f64,
+    /// Duration of session
     pub duration: Duration,
 }
 impl Session {
+    /// Creates a new session with given start & end, calculating duration from them
     pub fn new(start_time: f64, end_time: f64) -> Self {
         Session {
             start_time,
@@ -42,6 +47,7 @@ impl MetricsDb {
         Ok(MetricsDb { db, sessions })
     }
 
+    /// Returns sessions in database, based on `SESSION_TIME_GAP_THRESHOLD`
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
     }
