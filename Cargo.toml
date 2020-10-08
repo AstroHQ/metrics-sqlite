@@ -18,7 +18,9 @@ metrics-core = { version = "^0.5" }
 metrics-util = { version = "^0.3" }
 hdrhistogram = { version = "^6.3", default-features = false }
 thiserror = "1.0.20"
+log = "0.4.11"
 
 [dev-dependencies]
 metrics-runtime = { version = "0.13.1", default-features = false }
 metrics = "0.12.1"
+pretty_env_logger = "0.4"
