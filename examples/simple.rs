@@ -13,6 +13,7 @@ fn setup_metrics() {
             receiver.controller(),
             SqliteBuilder::new(),
             Duration::from_secs(5),
+            Duration::from_secs(60 * 60 * 24 * 7), // 60s * 60min * 24 hours * 7 days
             "metrics.db",
         )
         .expect("Failed to create SqliteExporter");
@@ -21,6 +22,9 @@ fn setup_metrics() {
     });
 }
 fn main() {
+    pretty_env_logger::formatted_builder()
+        .filter(None, log::LevelFilter::Trace)
+        .init();
     setup_metrics();
     loop {
         counter!("video.counter", 1);

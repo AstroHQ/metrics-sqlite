@@ -5,6 +5,8 @@
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
+#[macro_use]
+extern crate log;
 
 use diesel::insert_into;
 use diesel::prelude::*;
@@ -14,7 +16,10 @@ use metrics_core::{Builder, Drain, Key, Label, Observe, Observer};
 use metrics_util::{parse_quantiles, Quantile};
 use std::collections::HashMap;
 use std::path::Path;
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, SystemTime},
+};
 use thiserror::Error;
 
 /// Error type for any db/vitals related errors
@@ -149,10 +154,7 @@ impl Drain<Vec<models::NewMetric>> for SqliteObserver {
             }
             // println!("{:?}: {:?}", levels, values);
         }
-        let timestamp = std::time::SystemTime::UNIX_EPOCH
-            .elapsed()
-            .unwrap()
-            .as_secs_f64();
+        let timestamp = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs_f64();
         let results = self
             .contents
             .iter()
@@ -213,6 +215,7 @@ where
     controller: C,
     observer: B::Output,
     interval: Duration,
+    keep_duration: Duration,
     db: SqliteConnection,
 }
 
@@ -222,13 +225,18 @@ where
     B::Output: Drain<Vec<models::NewMetric>> + Observer,
     C: Observe,
 {
-    /// Creates a new [`SqliteExporter`] that stores metrics in a SQLite database file.
+    /// Creates a new `SqliteExporter` that stores metrics in a SQLite database file.
     ///
     /// Observers expose their output by being converted into a diesel model.
+    ///
+    /// `interval` specifies how often a sample is taken & stored to SQLite via `run()`
+    ///
+    /// `keep_duration` specifies how long data is kept before deleting, performed on `run()`
     pub fn new<P: AsRef<Path>>(
         controller: C,
         builder: B,
         interval: Duration,
+        keep_duration: Duration,
         path: P,
     ) -> Result<Self> {
         let db = setup_db(path)?;
@@ -236,16 +244,40 @@ where
             controller,
             observer: builder.build(),
             interval,
+            keep_duration,
             db,
         })
     }
 
     /// Runs this exporter on the current thread, storing on given interval
     pub fn run(&mut self) {
+        self.housekeeping();
         loop {
             thread::sleep(self.interval);
 
             self.turn();
+        }
+    }
+
+    /// Run housekeeping. Useful if you want to run it outside `run()` or on an occasional interval yourself
+    pub fn housekeeping(&self) {
+        use crate::schema::metrics::dsl::*;
+        match SystemTime::UNIX_EPOCH.elapsed() {
+            Ok(now) => {
+                let cutoff = now - self.keep_duration;
+                trace!("Deleting data {}s old", self.keep_duration.as_secs());
+                if let Err(e) = diesel::delete(metrics.filter(timestamp.le(cutoff.as_secs_f64())))
+                    .execute(&self.db)
+                {
+                    error!("Failed to remove old metrics data: {}", e);
+                }
+            }
+            Err(e) => {
+                error!(
+                    "System time error, skipping metrics-sqlite housekeeping: {}",
+                    e
+                );
+            }
         }
     }
 
