@@ -215,7 +215,7 @@ where
     controller: C,
     observer: B::Output,
     interval: Duration,
-    keep_duration: Duration,
+    keep_duration: Option<Duration>,
     db: SqliteConnection,
 }
 
@@ -236,7 +236,7 @@ where
         controller: C,
         builder: B,
         interval: Duration,
-        keep_duration: Duration,
+        keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
         let db = setup_db(path)?;
@@ -260,23 +260,28 @@ where
     }
 
     /// Run housekeeping. Useful if you want to run it outside `run()` or on an occasional interval yourself
+    ///
+    /// Does nothing if None was given for keep_duration in `new()`
     pub fn housekeeping(&self) {
         use crate::schema::metrics::dsl::*;
-        match SystemTime::UNIX_EPOCH.elapsed() {
-            Ok(now) => {
-                let cutoff = now - self.keep_duration;
-                trace!("Deleting data {}s old", self.keep_duration.as_secs());
-                if let Err(e) = diesel::delete(metrics.filter(timestamp.le(cutoff.as_secs_f64())))
-                    .execute(&self.db)
-                {
-                    error!("Failed to remove old metrics data: {}", e);
+        if let Some(keep_duration) = self.keep_duration {
+            match SystemTime::UNIX_EPOCH.elapsed() {
+                Ok(now) => {
+                    let cutoff = now - keep_duration;
+                    trace!("Deleting data {}s old", keep_duration.as_secs());
+                    if let Err(e) =
+                        diesel::delete(metrics.filter(timestamp.le(cutoff.as_secs_f64())))
+                            .execute(&self.db)
+                    {
+                        error!("Failed to remove old metrics data: {}", e);
+                    }
                 }
-            }
-            Err(e) => {
-                error!(
-                    "System time error, skipping metrics-sqlite housekeeping: {}",
-                    e
-                );
+                Err(e) => {
+                    error!(
+                        "System time error, skipping metrics-sqlite housekeeping: {}",
+                        e
+                    );
+                }
             }
         }
     }
