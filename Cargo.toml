@@ -1,6 +1,6 @@
 [package]
 name = "metrics-sqlite"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
@@ -10,17 +10,14 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-diesel = { version = "1.4.5", features = ["sqlite"] }
-diesel_migrations = "1.4.0"
-# this seems to let us force bundled sqlite in disel
-libsqlite3-sys = { version = "0.18.0", features = ["bundled"] }
-metrics-core = { version = "^0.5" }
-metrics-util = { version = "^0.3" }
-hdrhistogram = { version = "^6.3", default-features = false }
-thiserror = "1.0.20"
-log = "0.4.11"
+diesel = { version = "1.4", features = ["sqlite"] }
+diesel_migrations = "1.4"
+# this seems to let us force bundled sqlite in diesel
+libsqlite3-sys = { version = "0.18", features = ["bundled"] }
+metrics = { version = "0.14" }
+thiserror = "1.0"
+log = "0.4"
 
 [dev-dependencies]
-metrics-runtime = { version = "0.13.1", default-features = false }
-metrics = "0.12.1"
+metrics = "0.14"
 pretty_env_logger = "0.4"

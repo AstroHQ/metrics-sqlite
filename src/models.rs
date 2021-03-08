@@ -10,7 +10,7 @@ pub struct NewMetric {
     /// Key/name of sample
     pub key: String,
     /// Value of sample
-    pub value: i64,
+    pub value: f64,
 }
 
 /// Metric model for existing entries in sqlite database
@@ -23,5 +23,5 @@ pub struct Metric {
     /// Key/name of sample
     pub key: String,
     /// Value of sample
-    pub value: i64,
+    pub value: f64,
 }
