@@ -11,16 +11,20 @@ extern crate log;
 use diesel::insert_into;
 use diesel::prelude::*;
 
-use hdrhistogram::Histogram;
-use metrics_core::{Builder, Drain, Key, Label, Observe, Observer};
-use metrics_util::{parse_quantiles, Quantile};
-use std::collections::HashMap;
-use std::path::Path;
+use metrics::{Key, SetRecorderError};
+
 use std::{
-    thread,
-    time::{Duration, SystemTime},
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    path::Path,
+    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
+
+/// Max number of items allowed in worker's queue before flushing regardless of flush duration
+const FLUSH_QUEUE_LIMIT: usize = 1000;
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
@@ -43,7 +47,9 @@ pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
 mod metrics_db;
 mod models;
+mod recorder;
 mod schema;
+
 pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, NewMetric};
 
@@ -60,218 +66,120 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     Ok(db)
 }
 
-/// Builder for [`SqliteObserver`].
-pub struct SqliteBuilder {
-    quantiles: Vec<Quantile>,
-}
-
-impl SqliteBuilder {
-    /// Creates a new [`SqliteBuilder`] with default values.
-    pub fn new() -> Self {
-        let quantiles = parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]);
-
-        Self { quantiles }
-    }
-
-    /// Sets the quantiles to use when rendering histograms.
-    ///
-    /// Quantiles represent a scale of 0 to 1, where percentiles represent a scale of 1 to 100, so
-    /// a quantile of 0.99 is the 99th percentile, and a quantile of 0.99 is the 99.9th percentile.
-    ///
-    /// By default, the quantiles will be set to: 0.0, 0.5, 0.9, 0.95, 0.99, 0.999, and 1.0.
-    pub fn set_quantiles(mut self, quantiles: &[f64]) -> Self {
-        self.quantiles = parse_quantiles(quantiles);
-        self
-    }
-}
-
-impl Builder for SqliteBuilder {
-    type Output = SqliteObserver;
-
-    fn build(&self) -> Self::Output {
-        SqliteObserver {
-            quantiles: self.quantiles.clone(),
-            contents: HashMap::default(),
-            histos: HashMap::new(),
-        }
-    }
-}
-
-impl Default for SqliteBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Observes metrics in Sqlite (Diesel models) format.
-pub struct SqliteObserver {
-    pub(crate) quantiles: Vec<Quantile>,
-    // pub(crate) pretty: bool,
-    // pub(crate) tree: MetricsTree,
-    pub(crate) contents: HashMap<String, i64>,
-    pub(crate) histos: HashMap<Key, Histogram<u64>>,
-}
-
-impl Observer for SqliteObserver {
-    fn observe_counter(&mut self, key: Key, value: u64) {
-        let (levels, name) = key_to_parts(key);
-        let levels = levels.join(".");
-        // println!("Inserting value to {}.{}", levels, name);
-        self.contents
-            .insert(format!("{}.{}", levels, name), value as i64);
-    }
-
-    fn observe_gauge(&mut self, key: Key, value: i64) {
-        let (levels, name) = key_to_parts(key);
-        let levels = levels.join(".");
-        // println!("Inserting value to {}.{}", levels, name);
-        self.contents.insert(format!("{}.{}", levels, name), value);
-    }
-
-    fn observe_histogram(&mut self, key: Key, values: &[u64]) {
-        let entry = self
-            .histos
-            .entry(key)
-            .or_insert_with(|| Histogram::<u64>::new(3).expect("failed to create histogram"));
-
-        for value in values {
-            entry
-                .record(*value)
-                .expect("failed to observe histogram value");
-        }
-    }
-}
-impl Drain<Vec<models::NewMetric>> for SqliteObserver {
-    fn drain(&mut self) -> Vec<models::NewMetric> {
-        for (key, h) in self.histos.drain() {
-            let (levels, name) = key_to_parts(key);
-            let levels = levels.join(".");
-            let values = hist_to_values(name, h.clone(), &self.quantiles);
-            // self.tree.insert_values(levels, values);
-            for (name, value) in values {
-                self.contents
-                    .insert(format!("{}.{}", levels, name), value as i64);
-            }
-            // println!("{:?}: {:?}", levels, values);
-        }
-        let timestamp = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs_f64();
-        let results = self
-            .contents
-            .iter()
-            .map(|(k, v)| models::NewMetric {
-                key: k.into(),
-                value: *v,
-                timestamp,
-            })
-            .collect();
-        self.contents.clear();
-        results
-    }
-}
-
-fn key_to_parts(key: Key) -> (Vec<String>, String) {
-    let (name, labels) = key.into_parts();
-    let mut parts = name.split('.').map(ToOwned::to_owned).collect::<Vec<_>>();
-    let name = parts.pop().expect("name didn't have a single part");
-
-    let labels = labels
-        .into_iter()
-        .map(Label::into_parts)
-        .map(|(k, v)| format!("{}=\"{}\"", k, v))
-        .collect::<Vec<_>>()
-        .join(",");
-    let label = if labels.is_empty() {
-        String::new()
-    } else {
-        format!("{{{}}}", labels)
-    };
-
-    let fname = format!("{}{}", name, label);
-
-    (parts, fname)
-}
-
-fn hist_to_values(
-    name: String,
-    hist: Histogram<u64>,
-    quantiles: &[Quantile],
-) -> Vec<(String, u64)> {
-    let mut values = Vec::new();
-
-    values.push((format!("{}_count", name), hist.len()));
-    for quantile in quantiles {
-        let value = hist.value_at_quantile(quantile.value());
-        values.push((format!("{}_{}", name, quantile.label()), value));
-    }
-
-    values
+enum Event {
+    Stop,
+    // Flush,
+    Metric(NewMetric),
 }
 
 /// Exports metrics by converting them to a textual representation and logging them.
-pub struct SqliteExporter<C, B>
-where
-    B: Builder,
-{
-    controller: C,
-    observer: B::Output,
-    interval: Duration,
-    keep_duration: Option<Duration>,
-    db: SqliteConnection,
+pub struct SqliteExporter {
+    thread: Option<JoinHandle<()>>,
+    sender: SyncSender<Event>,
+    pub(crate) last_values: RefCell<HashMap<Key, f64>>,
+    pub(crate) counters: RefCell<HashMap<Key, u64>>,
 }
 
-impl<C, B> SqliteExporter<C, B>
-where
-    B: Builder,
-    B::Output: Drain<Vec<models::NewMetric>> + Observer,
-    C: Observe,
-{
+fn run_worker(
+    db: SqliteConnection,
+    receiver: Receiver<Event>,
+    flush_duration: Duration,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut queue = VecDeque::with_capacity(FLUSH_QUEUE_LIMIT);
+        let mut last_flush = Instant::now();
+        fn flush(
+            queue: &mut VecDeque<NewMetric>,
+            db: &SqliteConnection,
+        ) -> Result<(), diesel::result::Error> {
+            use crate::schema::metrics::dsl::metrics;
+            trace!("Flushing {} records", queue.len());
+            db.transaction::<_, diesel::result::Error, _>(|| {
+                for rec in queue.drain(0..) {
+                    insert_into(metrics).values(&rec).execute(db)?;
+                }
+                Ok(())
+            })?;
+            Ok(())
+        }
+        loop {
+            let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
+                Ok(Event::Stop) => {
+                    info!("Stopping SQLiteExporter worker");
+                    (true, true)
+                }
+                // Ok(Event::Flush) => (true, false),
+                Ok(Event::Metric(metric)) => {
+                    queue.push_back(metric);
+                    // Flush if we hit time or size threshold
+                    if last_flush.elapsed() > flush_duration {
+                        debug!("Flushing due to {}s timeout", flush_duration.as_secs());
+                        last_flush = Instant::now();
+                        (true, false)
+                    } else {
+                        (queue.len() >= FLUSH_QUEUE_LIMIT, false)
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    debug!("Flushing due to {}s timeout", flush_duration.as_secs());
+                    (true, false)
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    warn!("SQLiteExporter channel disconnected, exiting worker");
+                    (true, true)
+                }
+            };
+            if should_flush {
+                if let Err(e) = flush(&mut queue, &db) {
+                    error!("Error flushing metrics: {}", e);
+                }
+            }
+            if should_exit {
+                break;
+            }
+        }
+    })
+}
+
+impl SqliteExporter {
     /// Creates a new `SqliteExporter` that stores metrics in a SQLite database file.
     ///
     /// Observers expose their output by being converted into a diesel model.
     ///
-    /// `interval` specifies how often a sample is taken & stored to SQLite via `run()`
+    /// `flush_interval` specifies how often metrics are flushed to SQLite
     ///
-    /// `keep_duration` specifies how long data is kept before deleting, performed on `run()`
+    /// `keep_duration` specifies how long data is kept before deleting, performed new()
     pub fn new<P: AsRef<Path>>(
-        controller: C,
-        builder: B,
-        interval: Duration,
+        flush_interval: Duration,
         keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
         let db = setup_db(path)?;
-        Ok(SqliteExporter {
-            controller,
-            observer: builder.build(),
-            interval,
-            keep_duration,
-            db,
-        })
+        Self::housekeeping(&db, keep_duration);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1000);
+        let thread = run_worker(db, receiver, flush_interval);
+        let exporter = SqliteExporter {
+            thread: Some(thread),
+            sender,
+            last_values: RefCell::new(HashMap::new()),
+            counters: RefCell::new(HashMap::new()),
+        };
+        Ok(exporter)
     }
 
-    /// Runs this exporter on the current thread, storing on given interval
-    pub fn run(&mut self) {
-        self.housekeeping();
-        loop {
-            thread::sleep(self.interval);
-
-            self.turn();
-        }
-    }
-
-    /// Run housekeeping. Useful if you want to run it outside `run()` or on an occasional interval yourself
+    /// Run housekeeping.
     ///
     /// Does nothing if None was given for keep_duration in `new()`
-    pub fn housekeeping(&self) {
+    fn housekeeping(db: &SqliteConnection, keep_duration: Option<Duration>) {
         use crate::schema::metrics::dsl::*;
-        if let Some(keep_duration) = self.keep_duration {
+        if let Some(keep_duration) = keep_duration {
             match SystemTime::UNIX_EPOCH.elapsed() {
                 Ok(now) => {
                     let cutoff = now - keep_duration;
                     trace!("Deleting data {}s old", keep_duration.as_secs());
                     if let Err(e) =
                         diesel::delete(metrics.filter(timestamp.le(cutoff.as_secs_f64())))
-                            .execute(&self.db)
+                            .execute(db)
                     {
                         error!("Failed to remove old metrics data: {}", e);
                     }
@@ -286,13 +194,14 @@ where
         }
     }
 
-    /// Run this exporter, storing output only once.
-    pub fn turn(&mut self) {
-        use crate::schema::metrics::dsl::metrics;
-        self.controller.observe(&mut self.observer);
-        let output = self.observer.drain();
-        for rec in output {
-            insert_into(metrics).values(&rec).execute(&self.db).unwrap();
-        }
+    /// Install recorder as `metrics` crate's Recorder
+    pub fn install(self) -> Result<(), SetRecorderError> {
+        metrics::set_boxed_recorder(Box::new(self))
+    }
+}
+impl Drop for SqliteExporter {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Event::Stop);
+        let _ = self.thread.take().unwrap().join();
     }
 }

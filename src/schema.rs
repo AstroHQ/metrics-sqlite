@@ -3,7 +3,7 @@ table! {
         id -> BigInt,
         timestamp -> Double,
         key -> Text,
-        value -> BigInt,
+        value -> Double,
     }
 }
 
