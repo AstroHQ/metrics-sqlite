@@ -95,7 +95,7 @@ fn run_worker(
             use crate::schema::metrics::dsl::metrics;
             trace!("Flushing {} records", queue.len());
             db.transaction::<_, diesel::result::Error, _>(|| {
-                for rec in queue.drain(0..) {
+                for rec in queue.drain(..) {
                     insert_into(metrics).values(&rec).execute(db)?;
                 }
                 Ok(())

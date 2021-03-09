@@ -14,10 +14,9 @@ diesel = { version = "1.4", features = ["sqlite"] }
 diesel_migrations = "1.4"
 # this seems to let us force bundled sqlite in diesel
 libsqlite3-sys = { version = "0.18", features = ["bundled"] }
-metrics = { version = "0.14" }
+metrics = "0.14"
 thiserror = "1.0"
 log = "0.4"
 
 [dev-dependencies]
-metrics = "0.14"
 pretty_env_logger = "0.4"
