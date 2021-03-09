@@ -3,19 +3,18 @@ use metrics::{GaugeValue, Key, Recorder, Unit};
 use std::time::SystemTime;
 
 impl Recorder for SqliteExporter {
-    fn register_counter(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        println!("Registering counter: {} {:?} {:?}", key, unit, description);
+    // in future we could record these to the SQLite database for informational/metadata usage
+    fn register_counter(&self, _key: Key, _unit: Option<Unit>, _description: Option<&'static str>) {
     }
 
-    fn register_gauge(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        println!("Registering gauge: {} {:?} {:?}", key, unit, description);
-    }
+    fn register_gauge(&self, _key: Key, _unit: Option<Unit>, _description: Option<&'static str>) {}
 
-    fn register_histogram(&self, key: Key, unit: Option<Unit>, description: Option<&'static str>) {
-        println!(
-            "Registering histogram: {} {:?} {:?}",
-            key, unit, description
-        );
+    fn register_histogram(
+        &self,
+        _key: Key,
+        _unit: Option<Unit>,
+        _description: Option<&'static str>,
+    ) {
     }
 
     fn increment_counter(&self, key: Key, value: u64) {
