@@ -35,14 +35,14 @@ pub enum MetricsError {
     /// Error migrating database
     #[error("Migration error: {0}")]
     MigrationError(#[from] diesel_migrations::RunMigrationsError),
-    /// Error querying vitals DB
+    /// Error querying metrics DB
     #[error("Error querying DB: {0}")]
     QueryError(#[from] diesel::result::Error),
     /// Error if path given is invalid
     #[error("Invalid database path")]
     InvalidDatabasePath,
 }
-/// Vitals result type
+/// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
 mod metrics_db;
@@ -72,7 +72,7 @@ enum Event {
     Metric(NewMetric),
 }
 
-/// Exports metrics by converting them to a textual representation and logging them.
+/// Exports metrics by storing them in a SQLite database at a periodic interval
 pub struct SqliteExporter {
     thread: Option<JoinHandle<()>>,
     sender: SyncSender<Event>,
@@ -144,9 +144,7 @@ fn run_worker(
 impl SqliteExporter {
     /// Creates a new `SqliteExporter` that stores metrics in a SQLite database file.
     ///
-    /// Observers expose their output by being converted into a diesel model.
-    ///
-    /// `flush_interval` specifies how often metrics are flushed to SQLite
+    /// `flush_interval` specifies how often metrics are flushed to SQLite/disk
     ///
     /// `keep_duration` specifies how long data is kept before deleting, performed new()
     pub fn new<P: AsRef<Path>>(
