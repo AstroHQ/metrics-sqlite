@@ -8,6 +8,8 @@ categories = ["debugging"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+documentation = "https://docs.rs/metrics-sqlite"
+repository = "https://github.com/AstroHQ/metrics-sqlite/"
 
 [dependencies]
 diesel = { version = "1.4", features = ["sqlite"] }
