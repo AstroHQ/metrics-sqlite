@@ -11,10 +11,9 @@ extern crate log;
 use diesel::insert_into;
 use diesel::prelude::*;
 
-use metrics::{Key, SetRecorderError};
+use metrics::{Key, SetRecorderError, GaugeValue};
 
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
     path::Path,
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
@@ -69,15 +68,53 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
 enum Event {
     Stop,
     // Flush,
-    Metric(NewMetric),
+    IncrementCounter(Duration, Key, u64),
+    UpdateGauge(Duration, Key, GaugeValue),
+    UpdateHistogram(Duration, Key, f64),
 }
 
 /// Exports metrics by storing them in a SQLite database at a periodic interval
 pub struct SqliteExporter {
     thread: Option<JoinHandle<()>>,
     sender: SyncSender<Event>,
-    pub(crate) last_values: RefCell<HashMap<Key, f64>>,
-    pub(crate) counters: RefCell<HashMap<Key, u64>>,
+}
+struct InnerState {
+    flush_duration: Duration,
+    last_flush: Instant,
+    last_values: HashMap<Key, f64>,
+    counters: HashMap<Key, u64>,
+    queue: VecDeque<NewMetric>,
+}
+impl InnerState {
+    fn new(flush_duration: Duration) -> Self {
+        InnerState {
+            flush_duration,
+            last_flush: Instant::now(),
+            last_values: HashMap::new(),
+            counters: HashMap::new(),
+            queue: VecDeque::with_capacity(FLUSH_QUEUE_LIMIT),
+        }
+    }
+    fn should_flush(&mut self) -> bool {
+        if self.last_flush.elapsed() > self.flush_duration {
+            debug!("Flushing due to {}s timeout", self.flush_duration.as_secs());
+            true
+        } else {
+            self.queue.len() >= FLUSH_QUEUE_LIMIT
+        }
+    }
+    fn flush(&mut self, db: &SqliteConnection) -> Result<(), diesel::result::Error> {
+        use crate::schema::metrics::dsl::metrics;
+        trace!("Flushing {} records", self.queue.len());
+        db.transaction::<_, diesel::result::Error, _>(|| {
+            for rec in self.queue.drain(..) {
+                insert_into(metrics).values(&rec).execute(db)?;
+            }
+            Ok(())
+        })?;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
 }
 
 fn run_worker(
@@ -86,39 +123,64 @@ fn run_worker(
     flush_duration: Duration,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut queue = VecDeque::with_capacity(FLUSH_QUEUE_LIMIT);
-        let mut last_flush = Instant::now();
-        fn flush(
-            queue: &mut VecDeque<NewMetric>,
-            db: &SqliteConnection,
-        ) -> Result<(), diesel::result::Error> {
-            use crate::schema::metrics::dsl::metrics;
-            trace!("Flushing {} records", queue.len());
-            db.transaction::<_, diesel::result::Error, _>(|| {
-                for rec in queue.drain(..) {
-                    insert_into(metrics).values(&rec).execute(db)?;
-                }
-                Ok(())
-            })?;
-            Ok(())
-        }
+        let mut state = InnerState::new(flush_duration);
+
         loop {
             let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
                 Ok(Event::Stop) => {
-                    info!("Stopping SQLiteExporter worker");
+                    info!("Stopping SQLiteExporter worker, flushing & exiting");
                     (true, true)
                 }
                 // Ok(Event::Flush) => (true, false),
-                Ok(Event::Metric(metric)) => {
-                    queue.push_back(metric);
-                    // Flush if we hit time or size threshold
-                    if last_flush.elapsed() > flush_duration {
-                        debug!("Flushing due to {}s timeout", flush_duration.as_secs());
-                        last_flush = Instant::now();
-                        (true, false)
-                    } else {
-                        (queue.len() >= FLUSH_QUEUE_LIMIT, false)
-                    }
+                Ok(Event::IncrementCounter(timestamp, key, value)) => {
+                    let key_str = key.name().to_string();
+                    let entry = state.counters.entry(key).or_insert(0);
+                    let value = {
+                        *entry = *entry + value;
+                        *entry
+                    };
+                    let metric = NewMetric {
+                        timestamp: timestamp.as_secs_f64(),
+                        key: key_str,
+                        value: value as _,
+                    };
+                    state.queue.push_back(metric);
+                    (state.should_flush(), false)
+                }
+                Ok(Event::UpdateGauge(timestamp, key, value)) => {
+                    let key_str = key.name().to_string();
+                    let entry = state.last_values.entry(key).or_insert(0.0);
+                    let value = match value {
+                        GaugeValue::Absolute(v) => {
+                            *entry = v;
+                            *entry
+                        }
+                        GaugeValue::Increment(v) => {
+                            *entry = *entry + v;
+                            *entry
+                        }
+                        GaugeValue::Decrement(v) => {
+                            *entry = *entry - v;
+                            *entry
+                        }
+                    };
+                    let metric = NewMetric {
+                        timestamp: timestamp.as_secs_f64(),
+                        key: key_str,
+                        value: value as _,
+                    };
+                    state.queue.push_back(metric);
+                    (state.should_flush(), false)
+                }
+                Ok(Event::UpdateHistogram(timestamp, key, value)) => {
+                    let key_str = key.name().to_string();
+                    let metric = NewMetric {
+                        timestamp: timestamp.as_secs_f64(),
+                        key: key_str,
+                        value,
+                    };
+                    state.queue.push_back(metric);
+                    (state.should_flush(), false)
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     debug!("Flushing due to {}s timeout", flush_duration.as_secs());
@@ -130,7 +192,7 @@ fn run_worker(
                 }
             };
             if should_flush {
-                if let Err(e) = flush(&mut queue, &db) {
+                if let Err(e) = state.flush(&db) {
                     error!("Error flushing metrics: {}", e);
                 }
             }
@@ -159,8 +221,6 @@ impl SqliteExporter {
         let exporter = SqliteExporter {
             thread: Some(thread),
             sender,
-            last_values: RefCell::new(HashMap::new()),
-            counters: RefCell::new(HashMap::new()),
         };
         Ok(exporter)
     }
