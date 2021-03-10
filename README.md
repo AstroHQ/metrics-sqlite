@@ -1,23 +1,25 @@
 # SQLite Observer & Exporter for SQLite
 
+[![Rust](https://github.com/AstroHQ/metrics-sqlite/actions/workflows/rust.yml/badge.svg)](https://github.com/AstroHQ/metrics-sqlite/actions/workflows/rust.yml)
+[![docs](https://docs.rs/metrics-sqlite/badge.svg)](https://docs.rs/metrics-sqlite/)
+![Crates.io](https://img.shields.io/crates/l/metrics-sqlite)
+
+
 This provides a fairly simple SQLite powered backend for the [metrics](https://crates.io/crates/metrics) crate, useful for offline or desktop applications to gather metrics that can be easily queried afterwards.
 
 ## Example
 
-Example using `metrics_runtime` crate & sampling the metrics every 1s:
-
 ```Rust
-let receiver = Receiver::builder()
-    .build()
-    .expect("failed to create receiver");
+    let exporter = SqliteExporter::new(
+        Duration::from_secs(30), // flush to sqlite on disk every 30s (or internal buffer limit)
+        Some(Duration::from_secs(60 * 60 * 24 * 7)), // 60 sec * 60 min * 24 hours * 7 days
+        "metrics.db",
+    )
+    .expect("Failed to create SqliteExporter");
+    exporter
+        .install()
+        .expect("Failed to install SqliteExporter");
 
-let mut exporter = SqliteExporter::new(
-    receiver.controller(),
-    SqliteBuilder::new(),
-    Duration::from_secs(1),
-    "metrics.db",
-)
-.expect("Failed to create SqliteExporter");
-receiver.install();
-exporter.run();
+// use metrics macros etc.
+metrics::gauge!("mykey", 1.0);
 ```
