@@ -1,4 +1,4 @@
-use crate::{Event, NewMetric, SqliteExporter};
+use crate::{Event, SqliteExporter};
 use metrics::{GaugeValue, Key, Recorder, Unit};
 use std::time::SystemTime;
 
@@ -18,71 +18,41 @@ impl Recorder for SqliteExporter {
     }
 
     fn increment_counter(&self, key: Key, value: u64) {
-        let timestamp = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs_f64();
-        let mut counters = self.counters.borrow_mut();
-        let key_str = key.name().to_string();
-        let entry = counters.entry(key).or_insert(0);
-        let value = {
-            *entry = *entry + value;
-            *entry
-        };
-        let metric = NewMetric {
-            timestamp,
-            key: key_str,
-            value: value as _,
-        };
-        if let Err(e) = self.sender.try_send(Event::Metric(metric)) {
-            error!("Error sending metric to SQLite thread: {}", e);
+        match SystemTime::UNIX_EPOCH.elapsed() {
+            Ok(timestamp) => {
+                if let Err(e) = self.sender.try_send(Event::IncrementCounter(timestamp, key, value)) {
+                    error!("Error sending metric to SQLite thread: {}, dropping metric", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to get system time: {}, dropping metric", e);
+            }
         }
     }
 
     fn update_gauge(&self, key: Key, value: GaugeValue) {
-        let timestamp = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs_f64();
-        let mut last_values = self.last_values.borrow_mut();
-        let key_str = key.name().to_string();
-        let entry = last_values.entry(key).or_insert(0.0);
-        let value = match value {
-            GaugeValue::Absolute(v) => {
-                *entry = v;
-                *entry
+        match SystemTime::UNIX_EPOCH.elapsed() {
+            Ok(timestamp) => {
+                if let Err(e) = self.sender.try_send(Event::UpdateGauge(timestamp, key, value)) {
+                    error!("Error sending metric to SQLite thread: {}, dropping metric", e);
+                }
             }
-            GaugeValue::Increment(v) => {
-                *entry = *entry + v;
-                *entry
+            Err(e) => {
+                error!("Failed to get system time: {}, dropping metric", e);
             }
-            GaugeValue::Decrement(v) => {
-                *entry = *entry - v;
-                *entry
-            }
-        };
-
-        let metric = NewMetric {
-            timestamp,
-            key: key_str,
-            value,
-        };
-        if let Err(e) = self.sender.try_send(Event::Metric(metric)) {
-            error!("Error sending metric to SQLite thread: {}", e);
         }
     }
 
     fn record_histogram(&self, key: Key, value: f64) {
-        let timestamp = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs_f64();
-        let mut last_values = self.last_values.borrow_mut();
-        let key_str = key.name().to_string();
-        let entry = last_values.entry(key).or_insert(0.0);
-        let value = {
-            *entry = value;
-            *entry
-        };
-
-        let metric = NewMetric {
-            timestamp,
-            key: key_str,
-            value,
-        };
-        if let Err(e) = self.sender.try_send(Event::Metric(metric)) {
-            error!("Error sending metric to SQLite thread: {}", e);
+        match SystemTime::UNIX_EPOCH.elapsed() {
+            Ok(timestamp) => {
+                if let Err(e) = self.sender.try_send(Event::UpdateHistogram(timestamp, key, value)) {
+                    error!("Error sending metric to SQLite thread: {}, dropping metric", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to get system time: {}, dropping metric", e);
+            }
         }
     }
 }
