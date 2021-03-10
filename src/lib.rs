@@ -263,3 +263,29 @@ impl Drop for SqliteExporter {
         let _ = self.thread.take().unwrap().join();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Instant, Duration};
+    use crate::SqliteExporter;
+
+    #[test]
+    fn test_threading() {
+        use std::thread;
+        SqliteExporter::new(Duration::from_millis(500), None, "metrics.db").unwrap().install().unwrap();
+        let joins: Vec<thread::JoinHandle<()>> = (0..5).into_iter().map(|_| thread::spawn(move || {
+            let start = Instant::now();
+            loop {
+                metrics::gauge!("rate", 1.0);
+                metrics::increment_counter!("hits");
+                metrics::histogram!("histogram", 5.0);
+                if start.elapsed().as_secs() >= 5 {
+                    break;
+                }
+            }
+        })).collect();
+        for j in joins {
+            j.join().unwrap();
+        }
+    }
+}
