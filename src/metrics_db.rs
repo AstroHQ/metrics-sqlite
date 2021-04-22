@@ -125,7 +125,7 @@ impl MetricsDb {
     }
 
     /// Exports DB contents to CSV file
-    #[cfg(feature = "csv")]
+    #[cfg(feature = "export_csv")]
     pub fn export_to_csv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         use crate::schema::metrics::dsl::*;
         use std::fs::File;
