@@ -28,3 +28,7 @@ pretty_env_logger = "0.4"
 [features]
 default = []
 export_csv = ["csv", "serde/derive"]
+
+[[example]]
+name = "export_csv"
+required-features = ["export_csv"]
