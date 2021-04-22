@@ -11,7 +11,7 @@ extern crate log;
 use diesel::insert_into;
 use diesel::prelude::*;
 
-use metrics::{Key, SetRecorderError, GaugeValue};
+use metrics::{GaugeValue, Key, SetRecorderError};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -40,6 +40,14 @@ pub enum MetricsError {
     /// Error if path given is invalid
     #[error("Invalid database path")]
     InvalidDatabasePath,
+    /// IO Error with reader/writer
+    #[cfg(feature = "csv")]
+    #[error("IO Error: {0}")]
+    IoError(#[from] std::io::Error),
+    /// Error writing CSV
+    #[cfg(feature = "csv")]
+    #[error("CSV Error: {0}")]
+    CsvError(#[from] csv::Error),
 }
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
@@ -266,24 +274,32 @@ impl Drop for SqliteExporter {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Instant, Duration};
     use crate::SqliteExporter;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_threading() {
         use std::thread;
-        SqliteExporter::new(Duration::from_millis(500), None, "metrics.db").unwrap().install().unwrap();
-        let joins: Vec<thread::JoinHandle<()>> = (0..5).into_iter().map(|_| thread::spawn(move || {
-            let start = Instant::now();
-            loop {
-                metrics::gauge!("rate", 1.0);
-                metrics::increment_counter!("hits");
-                metrics::histogram!("histogram", 5.0);
-                if start.elapsed().as_secs() >= 5 {
-                    break;
-                }
-            }
-        })).collect();
+        SqliteExporter::new(Duration::from_millis(500), None, "metrics.db")
+            .unwrap()
+            .install()
+            .unwrap();
+        let joins: Vec<thread::JoinHandle<()>> = (0..5)
+            .into_iter()
+            .map(|_| {
+                thread::spawn(move || {
+                    let start = Instant::now();
+                    loop {
+                        metrics::gauge!("rate", 1.0);
+                        metrics::increment_counter!("hits");
+                        metrics::histogram!("histogram", 5.0);
+                        if start.elapsed().as_secs() >= 5 {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
         for j in joins {
             j.join().unwrap();
         }

@@ -1,6 +1,6 @@
 [package]
 name = "metrics-sqlite"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
@@ -19,6 +19,12 @@ libsqlite3-sys = { version = "0.18", features = ["bundled"] }
 metrics = "0.14"
 thiserror = "1.0"
 log = "0.4"
+csv = {version = "1.1.6", optional = true }
+serde = { version = "1.0.125", optional = true }
 
 [dev-dependencies]
 pretty_env_logger = "0.4"
+
+[features]
+default = []
+csv_export = ["csv", "serde/derive"]

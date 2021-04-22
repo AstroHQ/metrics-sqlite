@@ -123,4 +123,19 @@ impl MetricsDb {
             .collect();
         Ok(new_values)
     }
+
+    /// Exports DB contents to CSV file
+    #[cfg(feature = "csv")]
+    pub fn export_to_csv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        use crate::schema::metrics::dsl::*;
+        use std::fs::File;
+        let out_file = File::create(path)?;
+        let mut csv_writer = csv::Writer::from_writer(out_file);
+        let query = metrics.order(timestamp.asc());
+        for row in query.load::<Metric>(&self.db)? {
+            csv_writer.serialize(row)?;
+        }
+        csv_writer.flush()?;
+        Ok(())
+    }
 }

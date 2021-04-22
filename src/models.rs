@@ -15,6 +15,7 @@ pub struct NewMetric {
 
 /// Metric model for existing entries in sqlite database
 #[derive(Queryable, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Metric {
     /// Unique ID of sample
     pub id: i64,
