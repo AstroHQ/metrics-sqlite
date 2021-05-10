@@ -1,5 +1,6 @@
 //! Metrics DB, to use/query/etc metrics SQLite databases
 use super::{models::Metric, setup_db, Result};
+use crate::MetricsError;
 use diesel::prelude::*;
 use std::path::Path;
 use std::time::Duration;
@@ -58,6 +59,9 @@ impl MetricsDb {
             .select(timestamp)
             .order(timestamp.asc())
             .load::<f64>(db)?;
+        if timestamps.is_empty() {
+            return Err(MetricsError::EmptyDatabase);
+        }
         let mut sessions: Vec<Session> = Vec::new();
         let mut current_start = timestamps[0];
         for pair in timestamps.windows(2) {

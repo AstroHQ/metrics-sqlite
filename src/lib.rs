@@ -48,6 +48,9 @@ pub enum MetricsError {
     #[cfg(feature = "csv")]
     #[error("CSV Error: {0}")]
     CsvError(#[from] csv::Error),
+    /// Attempted to query database but found no records
+    #[error("Database has no metrics stored in it")]
+    EmptyDatabase,
 }
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
