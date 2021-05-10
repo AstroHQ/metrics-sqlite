@@ -1,6 +1,6 @@
 [package]
 name = "metrics-sqlite"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
