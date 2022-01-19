@@ -7,6 +7,11 @@
 
 This provides a fairly simple SQLite powered backend for the [metrics](https://crates.io/crates/metrics) crate, useful for offline or desktop applications to gather metrics that can be easily queried afterwards.
 
+## Version 0.3 Notes
+
+- Now vacuums on setup which can incur a delay in being ready to record
+- Migration of database blows away 0.2 data unfortunately
+
 ## Example
 
 ```Rust

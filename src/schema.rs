@@ -11,6 +11,7 @@ table! {
         id -> BigInt,
         key -> Text,
         unit -> Text,
+        description -> Text,
     }
 }
 
