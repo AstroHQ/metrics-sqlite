@@ -1,5 +1,6 @@
 //! Metrics DB, to use/query/etc metrics SQLite databases
 use super::{models::Metric, setup_db, Result};
+use crate::models::MetricKey;
 use crate::MetricsError;
 use diesel::prelude::*;
 use std::path::Path;
@@ -81,8 +82,11 @@ impl MetricsDb {
 
     /// Returns list of metrics keys stored in the database
     pub fn available_keys(&self) -> Result<Vec<String>> {
-        use crate::schema::metrics::dsl::*;
-        let r = metrics.select(key).distinct().load::<String>(&self.db)?;
+        use crate::schema::metric_keys::dsl::*;
+        let r = metric_keys
+            .select(key)
+            .distinct()
+            .load::<String>(&self.db)?;
         Ok(r)
     }
 
@@ -93,7 +97,10 @@ impl MetricsDb {
         session: Option<&Session>,
     ) -> Result<Vec<Metric>> {
         use crate::schema::metrics::dsl::*;
-        let query = metrics.order(timestamp.asc()).filter(key.eq(key_name));
+        let metric_key = self.metric_key_for_key(key_name)?;
+        let query = metrics
+            .order(timestamp.asc())
+            .filter(metric_key_id.eq(metric_key.id));
         let r = match session {
             Some(session) => query
                 .filter(timestamp.ge(session.start_time))
@@ -102,6 +109,15 @@ impl MetricsDb {
             None => query.load::<Metric>(&self.db)?,
         };
         Ok(r)
+    }
+
+    fn metric_key_for_key(&self, key_name: &str) -> Result<MetricKey> {
+        use crate::schema::metric_keys::dsl::*;
+        let query = metric_keys.filter(key.eq(key_name));
+        let keys = query.load::<MetricKey>(&self.db)?;
+        keys.into_iter()
+            .next()
+            .ok_or(MetricsError::KeyNotFound(key_name.to_string()))
     }
 
     /// Returns rate of change, the derivative, of the given metrics key's values

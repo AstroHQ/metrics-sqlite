@@ -2,8 +2,15 @@ table! {
     metrics (id) {
         id -> BigInt,
         timestamp -> Double,
-        key -> Text,
+        metric_key_id -> BigInt,
         value -> Double,
+    }
+}
+table! {
+    metric_keys (id) {
+        id -> BigInt,
+        key -> Text,
+        unit -> Text,
     }
 }
 

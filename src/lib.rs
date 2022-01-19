@@ -8,8 +8,8 @@ extern crate diesel_migrations;
 #[macro_use]
 extern crate log;
 
-use diesel::insert_into;
 use diesel::prelude::*;
+use diesel::{insert_into, sql_query};
 
 use metrics::{GaugeValue, Key, SetRecorderError};
 
@@ -51,6 +51,9 @@ pub enum MetricsError {
     /// Attempted to query database but found no records
     #[error("Database has no metrics stored in it")]
     EmptyDatabase,
+    /// Given metric key name wasn't found in the DB
+    #[error("Metric key {0} not found in database")]
+    KeyNotFound(String),
 }
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
@@ -61,7 +64,7 @@ mod recorder;
 mod schema;
 
 pub use metrics_db::{MetricsDb, Session};
-pub use models::{Metric, NewMetric};
+pub use models::{Metric, MetricKey, NewMetric};
 
 embed_migrations!("migrations");
 
@@ -94,6 +97,7 @@ struct InnerState {
     last_flush: Instant,
     last_values: HashMap<Key, f64>,
     counters: HashMap<Key, u64>,
+    key_ids: HashMap<String, i64>,
     queue: VecDeque<NewMetric>,
 }
 impl InnerState {
@@ -103,6 +107,7 @@ impl InnerState {
             last_flush: Instant::now(),
             last_values: HashMap::new(),
             counters: HashMap::new(),
+            key_ids: HashMap::new(),
             queue: VecDeque::with_capacity(FLUSH_QUEUE_LIMIT),
         }
     }
@@ -124,6 +129,30 @@ impl InnerState {
             Ok(())
         })?;
         self.last_flush = Instant::now();
+        Ok(())
+    }
+    fn queue_metric(
+        &mut self,
+        timestamp: Duration,
+        key: &str,
+        value: f64,
+        db: &SqliteConnection,
+    ) -> Result<()> {
+        let metric_key_id = match self.key_ids.get(key) {
+            Some(key) => *key,
+            None => {
+                info!("Looking up {}", key);
+                let key_id = MetricKey::key_by_name(key, db)?.id;
+                self.key_ids.insert(key.to_string(), key_id);
+                key_id
+            }
+        };
+        let metric = NewMetric {
+            timestamp: timestamp.as_secs_f64(),
+            metric_key_id,
+            value: value as _,
+        };
+        self.queue.push_back(metric);
         Ok(())
     }
 }
@@ -150,12 +179,10 @@ fn run_worker(
                         *entry = *entry + value;
                         *entry
                     };
-                    let metric = NewMetric {
-                        timestamp: timestamp.as_secs_f64(),
-                        key: key_str,
-                        value: value as _,
-                    };
-                    state.queue.push_back(metric);
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value as _, &db) {
+                        error!("Error queueing metric: {:?}", e);
+                    }
+
                     (state.should_flush(), false)
                 }
                 Ok(Event::UpdateGauge(timestamp, key, value)) => {
@@ -175,22 +202,17 @@ fn run_worker(
                             *entry
                         }
                     };
-                    let metric = NewMetric {
-                        timestamp: timestamp.as_secs_f64(),
-                        key: key_str,
-                        value: value as _,
-                    };
-                    state.queue.push_back(metric);
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value, &db) {
+                        error!("Error queueing metric: {:?}", e);
+                    }
                     (state.should_flush(), false)
                 }
                 Ok(Event::UpdateHistogram(timestamp, key, value)) => {
                     let key_str = key.name().to_string();
-                    let metric = NewMetric {
-                        timestamp: timestamp.as_secs_f64(),
-                        key: key_str,
-                        value,
-                    };
-                    state.queue.push_back(metric);
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value, &db) {
+                        error!("Error queueing metric: {:?}", e);
+                    }
+
                     (state.should_flush(), false)
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -251,6 +273,9 @@ impl SqliteExporter {
                             .execute(db)
                     {
                         error!("Failed to remove old metrics data: {}", e);
+                    }
+                    if let Err(e) = sql_query("VACUUM").execute(db) {
+                        error!("Failed to vacuum SQLite DB: {:?}", e);
                     }
                 }
                 Err(e) => {
