@@ -19,7 +19,11 @@ fn main() {
         .init();
     setup_metrics();
     metrics::register_counter!("video.counter");
-    metrics::register_gauge!("net.quality.rate", metrics::Unit::MegabitsPerSecond);
+    metrics::register_gauge!(
+        "net.quality.rate",
+        metrics::Unit::MegabitsPerSecond,
+        "Quality's bit rate"
+    );
 
     loop {
         gauge!("rate_control.previous_metered_throughput", 2134.0);

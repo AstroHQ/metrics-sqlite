@@ -11,7 +11,7 @@ extern crate log;
 use diesel::prelude::*;
 use diesel::{insert_into, sql_query};
 
-use metrics::{GaugeValue, Key, SetRecorderError};
+use metrics::{GaugeValue, Key, SetRecorderError, Unit};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -78,10 +78,15 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
 
     Ok(db)
 }
+enum RegisterType {
+    Counter,
+    Gauge,
+    Histogram,
+}
 
 enum Event {
     Stop,
-    // Flush,
+    RegisterKey(RegisterType, Key, Option<Unit>, Option<&'static str>),
     IncrementCounter(Duration, Key, u64),
     UpdateGauge(Duration, Key, GaugeValue),
     UpdateHistogram(Duration, Key, f64),
@@ -171,7 +176,14 @@ fn run_worker(
                     info!("Stopping SQLiteExporter worker, flushing & exiting");
                     (true, true)
                 }
-                // Ok(Event::Flush) => (true, false),
+                Ok(Event::RegisterKey(_key_type, key, unit, desc)) => {
+                    if let Err(e) =
+                        MetricKey::create_or_update(&key.name().to_string(), unit, desc, &db)
+                    {
+                        error!("Failed to create key entry: {:?}", e);
+                    }
+                    (false, false)
+                }
                 Ok(Event::IncrementCounter(timestamp, key, value)) => {
                     let key_str = key.name().to_string();
                     let entry = state.counters.entry(key).or_insert(0);
