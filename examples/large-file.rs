@@ -9,13 +9,14 @@ fn setup_metrics() {
         "metrics-large.db",
     )
     .expect("Failed to create SqliteExporter");
+    exporter.set_periodic_housekeeping(Some(Duration::from_secs(10)), None, Some(1_000_000));
     exporter
         .install()
         .expect("Failed to install SqliteExporter");
 }
 fn main() {
     pretty_env_logger::formatted_builder()
-        .filter(None, log::LevelFilter::Info)
+        .filter(None, log::LevelFilter::Trace)
         .init();
     setup_metrics();
     metrics::register_counter!("video.counter");
@@ -34,7 +35,7 @@ fn main() {
         counter!("net.packets", 2);
         gauge!("net.quality.rate", 231.2);
         // let start = std::time::Instant::now();
-        std::thread::sleep(Duration::from_micros(500));
+        std::thread::sleep(Duration::from_micros(1000));
         // timing!("net.time.delay", start, std::time::Instant::now());
     }
 }

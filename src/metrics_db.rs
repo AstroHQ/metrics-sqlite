@@ -117,7 +117,7 @@ impl MetricsDb {
         let keys = query.load::<MetricKey>(&self.db)?;
         keys.into_iter()
             .next()
-            .ok_or(MetricsError::KeyNotFound(key_name.to_string()))
+            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
     }
 
     /// Returns rate of change, the derivative, of the given metrics key's values

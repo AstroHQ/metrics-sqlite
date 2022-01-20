@@ -24,6 +24,7 @@ use thiserror::Error;
 
 /// Max number of items allowed in worker's queue before flushing regardless of flush duration
 const FLUSH_QUEUE_LIMIT: usize = 1000;
+const BACKGROUND_CHANNEL_LIMIT: usize = 8000;
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
@@ -90,6 +91,11 @@ enum Event {
     IncrementCounter(Duration, Key, u64),
     UpdateGauge(Duration, Key, GaugeValue),
     UpdateHistogram(Duration, Key, f64),
+    SetHousekeeping {
+        retention_period: Option<Duration>,
+        housekeeping_period: Option<Duration>,
+        record_limit: Option<usize>,
+    },
 }
 
 /// Exports metrics by storing them in a SQLite database at a periodic interval
@@ -98,6 +104,11 @@ pub struct SqliteExporter {
     sender: SyncSender<Event>,
 }
 struct InnerState {
+    db: SqliteConnection,
+    last_housekeeping: Instant,
+    housekeeping: Option<Duration>,
+    retention: Option<Duration>,
+    record_limit: Option<usize>,
     flush_duration: Duration,
     last_flush: Instant,
     last_values: HashMap<Key, f64>,
@@ -106,8 +117,13 @@ struct InnerState {
     queue: VecDeque<NewMetric>,
 }
 impl InnerState {
-    fn new(flush_duration: Duration) -> Self {
+    fn new(flush_duration: Duration, db: SqliteConnection) -> Self {
         InnerState {
+            db,
+            last_housekeeping: Instant::now(),
+            housekeeping: None,
+            retention: None,
+            record_limit: None,
             flush_duration,
             last_flush: Instant::now(),
             last_values: HashMap::new(),
@@ -116,7 +132,29 @@ impl InnerState {
             queue: VecDeque::with_capacity(FLUSH_QUEUE_LIMIT),
         }
     }
-    fn should_flush(&mut self) -> bool {
+    fn set_housekeeping(
+        &mut self,
+        retention: Option<Duration>,
+        housekeeping_duration: Option<Duration>,
+        record_limit: Option<usize>,
+    ) {
+        self.retention = retention;
+        self.housekeeping = housekeeping_duration;
+        self.last_housekeeping = Instant::now();
+        self.record_limit = record_limit;
+    }
+    fn should_housekeep(&self) -> bool {
+        match self.housekeeping {
+            Some(duration) => self.last_housekeeping.elapsed() > duration,
+            None => false,
+        }
+    }
+    fn housekeep(&mut self) -> Result<(), diesel::result::Error> {
+        SqliteExporter::housekeeping(&self.db, self.retention, self.record_limit, false);
+        self.last_housekeeping = Instant::now();
+        Ok(())
+    }
+    fn should_flush(&self) -> bool {
         if self.last_flush.elapsed() > self.flush_duration {
             debug!("Flushing due to {}s timeout", self.flush_duration.as_secs());
             true
@@ -124,11 +162,13 @@ impl InnerState {
             self.queue.len() >= FLUSH_QUEUE_LIMIT
         }
     }
-    fn flush(&mut self, db: &SqliteConnection) -> Result<(), diesel::result::Error> {
+    fn flush(&mut self) -> Result<(), diesel::result::Error> {
         use crate::schema::metrics::dsl::metrics;
-        trace!("Flushing {} records", self.queue.len());
+        // trace!("Flushing {} records", self.queue.len());
+        let db = &self.db;
+        let queue = self.queue.drain(..);
         db.transaction::<_, diesel::result::Error, _>(|| {
-            for rec in self.queue.drain(..) {
+            for rec in queue {
                 insert_into(metrics).values(&rec).execute(db)?;
             }
             Ok(())
@@ -136,18 +176,12 @@ impl InnerState {
         self.last_flush = Instant::now();
         Ok(())
     }
-    fn queue_metric(
-        &mut self,
-        timestamp: Duration,
-        key: &str,
-        value: f64,
-        db: &SqliteConnection,
-    ) -> Result<()> {
+    fn queue_metric(&mut self, timestamp: Duration, key: &str, value: f64) -> Result<()> {
         let metric_key_id = match self.key_ids.get(key) {
             Some(key) => *key,
             None => {
-                info!("Looking up {}", key);
-                let key_id = MetricKey::key_by_name(key, db)?.id;
+                debug!("Looking up {}", key);
+                let key_id = MetricKey::key_by_name(key, &self.db)?.id;
                 self.key_ids.insert(key.to_string(), key_id);
                 key_id
             }
@@ -168,7 +202,7 @@ fn run_worker(
     flush_duration: Duration,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut state = InnerState::new(flush_duration);
+        let mut state = InnerState::new(flush_duration, db);
 
         loop {
             let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
@@ -176,9 +210,17 @@ fn run_worker(
                     info!("Stopping SQLiteExporter worker, flushing & exiting");
                     (true, true)
                 }
+                Ok(Event::SetHousekeeping {
+                    retention_period,
+                    housekeeping_period,
+                    record_limit,
+                }) => {
+                    state.set_housekeeping(retention_period, housekeeping_period, record_limit);
+                    (false, false)
+                }
                 Ok(Event::RegisterKey(_key_type, key, unit, desc)) => {
                     if let Err(e) =
-                        MetricKey::create_or_update(&key.name().to_string(), unit, desc, &db)
+                        MetricKey::create_or_update(&key.name().to_string(), unit, desc, &state.db)
                     {
                         error!("Failed to create key entry: {:?}", e);
                     }
@@ -188,10 +230,10 @@ fn run_worker(
                     let key_str = key.name().to_string();
                     let entry = state.counters.entry(key).or_insert(0);
                     let value = {
-                        *entry = *entry + value;
+                        *entry += value;
                         *entry
                     };
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value as _, &db) {
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
                         error!("Error queueing metric: {:?}", e);
                     }
 
@@ -206,22 +248,22 @@ fn run_worker(
                             *entry
                         }
                         GaugeValue::Increment(v) => {
-                            *entry = *entry + v;
+                            *entry += v;
                             *entry
                         }
                         GaugeValue::Decrement(v) => {
-                            *entry = *entry - v;
+                            *entry -= v;
                             *entry
                         }
                     };
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value, &db) {
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
                         error!("Error queueing metric: {:?}", e);
                     }
                     (state.should_flush(), false)
                 }
                 Ok(Event::UpdateHistogram(timestamp, key, value)) => {
                     let key_str = key.name().to_string();
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value, &db) {
+                    if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
                         error!("Error queueing metric: {:?}", e);
                     }
 
@@ -237,8 +279,13 @@ fn run_worker(
                 }
             };
             if should_flush {
-                if let Err(e) = state.flush(&db) {
+                if let Err(e) = state.flush() {
                     error!("Error flushing metrics: {}", e);
+                }
+            }
+            if state.should_housekeep() {
+                if let Err(e) = state.housekeep() {
+                    error!("Failed running house keeping: {:?}", e);
                 }
             }
             if should_exit {
@@ -260,8 +307,8 @@ impl SqliteExporter {
         path: P,
     ) -> Result<Self> {
         let db = setup_db(path)?;
-        Self::housekeeping(&db, keep_duration);
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1000);
+        Self::housekeeping(&db, keep_duration, None, true);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
         let thread = run_worker(db, receiver, flush_interval);
         let exporter = SqliteExporter {
             thread: Some(thread),
@@ -270,11 +317,35 @@ impl SqliteExporter {
         Ok(exporter)
     }
 
+    /// Sets optional periodic house keeping, None to disable (disabled by default)
+    /// ## Notes
+    /// Periodic house keeping can affect metric recording, causing some data to be dropped during
+    pub fn set_periodic_housekeeping(
+        &self,
+        periodic_duration: Option<Duration>,
+        retention: Option<Duration>,
+        record_limit: Option<usize>,
+    ) {
+        if let Err(e) = self.sender.send(Event::SetHousekeeping {
+            retention_period: retention,
+            housekeeping_period: periodic_duration,
+            record_limit,
+        }) {
+            error!("Failed to set house keeping settings: {:?}", e);
+        }
+    }
+
     /// Run housekeeping.
     ///
     /// Does nothing if None was given for keep_duration in `new()`
-    fn housekeeping(db: &SqliteConnection, keep_duration: Option<Duration>) {
+    fn housekeeping(
+        db: &SqliteConnection,
+        keep_duration: Option<Duration>,
+        record_limit: Option<usize>,
+        vacuum: bool,
+    ) {
         use crate::schema::metrics::dsl::*;
+        use diesel::dsl::count;
         if let Some(keep_duration) = keep_duration {
             match SystemTime::UNIX_EPOCH.elapsed() {
                 Ok(now) => {
@@ -286,8 +357,10 @@ impl SqliteExporter {
                     {
                         error!("Failed to remove old metrics data: {}", e);
                     }
-                    if let Err(e) = sql_query("VACUUM").execute(db) {
-                        error!("Failed to vacuum SQLite DB: {:?}", e);
+                    if vacuum {
+                        if let Err(e) = sql_query("VACUUM").execute(db) {
+                            error!("Failed to vacuum SQLite DB: {:?}", e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -295,6 +368,30 @@ impl SqliteExporter {
                         "System time error, skipping metrics-sqlite housekeeping: {}",
                         e
                     );
+                }
+            }
+        }
+        if let Some(record_limit) = record_limit {
+            trace!("Checking for records over {} limit", record_limit);
+            match metrics.select(count(id)).first::<i64>(db) {
+                Ok(records) => {
+                    let records = records as usize;
+                    if records > record_limit {
+                        let excess = records - record_limit + (record_limit / 4); // delete excess + 25% of limit
+                        trace!(
+                            "Exceeded limit! {} > {}, deleting {} oldest",
+                            records,
+                            record_limit,
+                            excess
+                        );
+                        let query = format!("DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {});", excess);
+                        if let Err(e) = sql_query(query).execute(db) {
+                            error!("Failed to delete excessive records: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to get record count: {:?}", e);
                 }
             }
         }
