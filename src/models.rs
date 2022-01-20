@@ -53,9 +53,7 @@ impl<'a> MetricKey<'a> {
         let unit_value = unit
             .map(|u| Cow::Owned(u.as_str().to_string()))
             .unwrap_or(Cow::Borrowed(""));
-        let description = description
-            .map(|u| Cow::Borrowed(u))
-            .unwrap_or(Cow::Borrowed(""));
+        let description = description.map(Cow::Borrowed).unwrap_or(Cow::Borrowed(""));
         Self::update(key.id, unit_value, description, db)?;
         Ok(key)
     }
@@ -95,7 +93,7 @@ impl<'a> MetricKey<'a> {
         let keys = query.load::<MetricKey>(db)?;
         keys.into_iter()
             .next()
-            .ok_or(MetricsError::KeyNotFound(key_name.to_string()))
+            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
     }
 }
 

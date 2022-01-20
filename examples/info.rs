@@ -4,7 +4,7 @@ fn main() {
     let db = MetricsDb::new("metrics.db").unwrap();
     println!("Keys: {}", db.available_keys().unwrap().join(", "));
     let sessions = db.sessions();
-    for (i, s) in sessions.into_iter().enumerate() {
+    for (i, s) in sessions.iter().enumerate() {
         println!(
             "Session {}: {:.2}s long ({:.2} - {:.2})",
             i + 1,
