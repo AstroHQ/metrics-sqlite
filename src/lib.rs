@@ -319,7 +319,8 @@ impl SqliteExporter {
 
     /// Sets optional periodic house keeping, None to disable (disabled by default)
     /// ## Notes
-    /// Periodic house keeping can affect metric recording, causing some data to be dropped during
+    /// Periodic house keeping can affect metric recording, causing some data to be dropped during house keeping.
+    /// Record limit if set will cause anything over limit + 25% of limit to be removed
     pub fn set_periodic_housekeeping(
         &self,
         periodic_duration: Option<Duration>,
