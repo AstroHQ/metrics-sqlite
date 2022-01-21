@@ -147,15 +147,34 @@ impl MetricsDb {
     /// Exports DB contents to CSV file
     #[cfg(feature = "export_csv")]
     pub fn export_to_csv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        use crate::schema::metric_keys::dsl::key;
         use crate::schema::metrics::dsl::*;
         use std::fs::File;
         let out_file = File::create(path)?;
         let mut csv_writer = csv::Writer::from_writer(out_file);
-        let query = metrics.order(timestamp.asc());
-        for row in query.load::<Metric>(&self.db)? {
+        // join the 2 tables so we get a flat CSV with the actual key names
+        let query = crate::schema::metrics::table.inner_join(crate::schema::metric_keys::table);
+        let query = query
+            .order(timestamp.asc())
+            .select((id, timestamp, key, value));
+        for row in query.load::<JoinedMetric>(&self.db)? {
             csv_writer.serialize(row)?;
         }
         csv_writer.flush()?;
         Ok(())
     }
+}
+/// Metric model for CSV export
+#[cfg(feature = "export_csv")]
+#[derive(Queryable, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+struct JoinedMetric {
+    /// Unique ID of sample
+    pub id: i64,
+    /// Timestamp of sample
+    pub timestamp: f64,
+    /// Key/name of sample
+    pub key: String,
+    /// Value of sample
+    pub value: f64,
 }
