@@ -1,6 +1,6 @@
 [package]
 name = "metrics-sqlite"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
@@ -29,7 +29,12 @@ pretty_env_logger = "0.4"
 default = []
 log_dropped_metrics = []
 export_csv = ["csv", "serde/derive"]
+import_csv = ["csv", "serde/derive"]
 
 [[example]]
 name = "export_csv"
 required-features = ["export_csv"]
+
+[[example]]
+name = "import_csv"
+required-features = ["import_csv"]

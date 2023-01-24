@@ -3,6 +3,8 @@ use super::{models::Metric, setup_db, Result};
 use crate::models::MetricKey;
 use crate::MetricsError;
 use diesel::prelude::*;
+#[cfg(feature = "import_csv")]
+use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -163,6 +165,55 @@ impl MetricsDb {
         csv_writer.flush()?;
         Ok(())
     }
+    /// Imports CSV file into a MetricsDb file
+    #[cfg(feature = "import_csv")]
+    pub fn import_from_csv<S: AsRef<Path>, D: AsRef<Path>>(path: S, destination: D) -> Result<()> {
+        use crate::InnerState;
+        use csv::ReaderBuilder;
+        let db = setup_db(destination)?;
+        let mut reader = ReaderBuilder::new().from_path(path)?;
+        let mut inner = InnerState::new(Duration::from_secs(5), db);
+        let header = reader.headers()?.to_owned();
+        let mut flush_counter = 0u64;
+        for record in reader.records() {
+            match record {
+                Ok(record) => match record.deserialize::<MetricCsvRow>(Some(&header)) {
+                    Ok(r) => {
+                        if let Err(e) =
+                            inner.queue_metric(Duration::from_secs_f64(r.timestamp), r.key, r.value)
+                        {
+                            error!(
+                                "Skipping record due to error recording metric into DB: {:?}",
+                                e
+                            );
+                        }
+                        flush_counter += 1;
+                    }
+                    Err(e) => {
+                        error!("Skipping record due to error parsing CSV row: {:?}", e);
+                    }
+                },
+                Err(e) => {
+                    error!("Skipping record due to error reading CSV record: {:?}", e);
+                }
+            }
+            if flush_counter % 200 == 0 {
+                trace!("Flushing");
+                inner.flush()?;
+            }
+        }
+        inner.flush()?;
+        Ok(())
+    }
+}
+#[cfg(feature = "import_csv")]
+#[derive(Deserialize)]
+struct MetricCsvRow<'a> {
+    #[allow(unused)]
+    id: u64,
+    timestamp: f64,
+    key: &'a str,
+    value: f64,
 }
 /// Metric model for CSV export
 #[cfg(feature = "export_csv")]
