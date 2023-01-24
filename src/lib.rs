@@ -201,98 +201,105 @@ fn run_worker(
     receiver: Receiver<Event>,
     flush_duration: Duration,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut state = InnerState::new(flush_duration, db);
-
-        loop {
-            let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
-                Ok(Event::Stop) => {
-                    info!("Stopping SQLiteExporter worker, flushing & exiting");
-                    (true, true)
-                }
-                Ok(Event::SetHousekeeping {
-                    retention_period,
-                    housekeeping_period,
-                    record_limit,
-                }) => {
-                    state.set_housekeeping(retention_period, housekeeping_period, record_limit);
-                    (false, false)
-                }
-                Ok(Event::RegisterKey(_key_type, key, unit, desc)) => {
-                    if let Err(e) =
-                        MetricKey::create_or_update(&key.name().to_string(), unit, desc, &state.db)
-                    {
-                        error!("Failed to create key entry: {:?}", e);
+    thread::Builder::new()
+        .name("metrics-sqlite: worker".to_string())
+        .spawn(move || {
+            let mut state = InnerState::new(flush_duration, db);
+            info!("SQLite worker started");
+            loop {
+                let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
+                    Ok(Event::Stop) => {
+                        info!("Stopping SQLiteExporter worker, flushing & exiting");
+                        (true, true)
                     }
-                    (false, false)
-                }
-                Ok(Event::IncrementCounter(timestamp, key, value)) => {
-                    let key_str = key.name().to_string();
-                    let entry = state.counters.entry(key).or_insert(0);
-                    let value = {
-                        *entry += value;
-                        *entry
-                    };
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
-                        error!("Error queueing metric: {:?}", e);
+                    Ok(Event::SetHousekeeping {
+                        retention_period,
+                        housekeeping_period,
+                        record_limit,
+                    }) => {
+                        state.set_housekeeping(retention_period, housekeeping_period, record_limit);
+                        (false, false)
                     }
-
-                    (state.should_flush(), false)
-                }
-                Ok(Event::UpdateGauge(timestamp, key, value)) => {
-                    let key_str = key.name().to_string();
-                    let entry = state.last_values.entry(key).or_insert(0.0);
-                    let value = match value {
-                        GaugeValue::Absolute(v) => {
-                            *entry = v;
-                            *entry
+                    Ok(Event::RegisterKey(_key_type, key, unit, desc)) => {
+                        info!("Registering {:?}", key);
+                        if let Err(e) = MetricKey::create_or_update(
+                            &key.name().to_string(),
+                            unit,
+                            desc,
+                            &state.db,
+                        ) {
+                            error!("Failed to create key entry: {:?}", e);
                         }
-                        GaugeValue::Increment(v) => {
-                            *entry += v;
-                            *entry
-                        }
-                        GaugeValue::Decrement(v) => {
-                            *entry -= v;
-                            *entry
-                        }
-                    };
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
-                        error!("Error queueing metric: {:?}", e);
+                        (false, false)
                     }
-                    (state.should_flush(), false)
-                }
-                Ok(Event::UpdateHistogram(timestamp, key, value)) => {
-                    let key_str = key.name().to_string();
-                    if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
-                        error!("Error queueing metric: {:?}", e);
-                    }
+                    Ok(Event::IncrementCounter(timestamp, key, value)) => {
+                        let key_str = key.name().to_string();
+                        let entry = state.counters.entry(key).or_insert(0);
+                        let value = {
+                            *entry += value;
+                            *entry
+                        };
+                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                            error!("Error queueing metric: {:?}", e);
+                        }
 
-                    (state.should_flush(), false)
+                        (state.should_flush(), false)
+                    }
+                    Ok(Event::UpdateGauge(timestamp, key, value)) => {
+                        let key_str = key.name().to_string();
+                        let entry = state.last_values.entry(key).or_insert(0.0);
+                        let value = match value {
+                            GaugeValue::Absolute(v) => {
+                                *entry = v;
+                                *entry
+                            }
+                            GaugeValue::Increment(v) => {
+                                *entry += v;
+                                *entry
+                            }
+                            GaugeValue::Decrement(v) => {
+                                *entry -= v;
+                                *entry
+                            }
+                        };
+                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                            error!("Error queueing metric: {:?}", e);
+                        }
+                        (state.should_flush(), false)
+                    }
+                    Ok(Event::UpdateHistogram(timestamp, key, value)) => {
+                        let key_str = key.name().to_string();
+                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                            error!("Error queueing metric: {:?}", e);
+                        }
+
+                        (state.should_flush(), false)
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        debug!("Flushing due to {}s timeout", flush_duration.as_secs());
+                        (true, false)
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        warn!("SQLiteExporter channel disconnected, exiting worker");
+                        (true, true)
+                    }
+                };
+                if should_flush {
+                    if let Err(e) = state.flush() {
+                        error!("Error flushing metrics: {}", e);
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    debug!("Flushing due to {}s timeout", flush_duration.as_secs());
-                    (true, false)
+                if state.should_housekeep() {
+                    if let Err(e) = state.housekeep() {
+                        error!("Failed running house keeping: {:?}", e);
+                    }
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    warn!("SQLiteExporter channel disconnected, exiting worker");
-                    (true, true)
-                }
-            };
-            if should_flush {
-                if let Err(e) = state.flush() {
-                    error!("Error flushing metrics: {}", e);
+                if should_exit {
+                    break;
                 }
             }
-            if state.should_housekeep() {
-                if let Err(e) = state.housekeep() {
-                    error!("Failed running house keeping: {:?}", e);
-                }
-            }
-            if should_exit {
-                break;
-            }
-        }
-    })
+        })
+        .unwrap()
 }
 
 impl SqliteExporter {
