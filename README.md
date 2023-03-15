@@ -6,6 +6,11 @@
 
 
 This provides a fairly simple SQLite powered backend for the [metrics](https://crates.io/crates/metrics) crate, useful for offline or desktop applications to gather metrics that can be easily queried afterwards.
+## Version 0.4 Notes
+
+- Now works with metrics 0.20.x
+- _register!() macros aren't required & don't do anything with this exporter currently
+- Unit/description now available via _describe!() macros metrics provides
 
 ## Version 0.3 Notes
 
