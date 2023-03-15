@@ -19,8 +19,8 @@ fn main() {
         .filter(None, log::LevelFilter::Trace)
         .init();
     setup_metrics();
-    metrics::register_counter!("video.counter");
-    metrics::register_gauge!(
+    metrics::describe_counter!("video.counter", "video frames");
+    metrics::describe_gauge!(
         "net.quality.rate",
         metrics::Unit::MegabitsPerSecond,
         "Quality's bit rate"
