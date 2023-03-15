@@ -136,7 +136,7 @@ impl MetricsDb {
             .windows(2)
             .map(|v| {
                 let new_value =
-                    (v[1].value - v[0].value) as f64 / (v[1].timestamp - v[0].timestamp);
+                    (v[1].value - v[0].value) / (v[1].timestamp - v[0].timestamp);
                 DerivMetric {
                     timestamp: v[1].timestamp,
                     key: format!("{}.deriv", key_name),

@@ -229,7 +229,7 @@ fn run_worker(
                     Ok(Event::DescribeKey(_key_type, key, unit, desc)) => {
                         info!("Describing key {:?}", key);
                         if let Err(e) = MetricKey::create_or_update(
-                            &key.as_str(),
+                            key.as_str(),
                             unit,
                             Some(desc.as_ref()),
                             &mut state.db,
@@ -448,7 +448,6 @@ mod tests {
             .install()
             .unwrap();
         let joins: Vec<thread::JoinHandle<()>> = (0..5)
-            .into_iter()
             .map(|_| {
                 thread::spawn(move || {
                     let start = Instant::now();
