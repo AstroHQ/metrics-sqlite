@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 /// A new metric measurement for storing into sqlite database
 #[derive(Insertable, Debug)]
-#[table_name = "metrics"]
+#[diesel(table_name = metrics)]
 pub struct NewMetric {
     /// Timestamp of sample
     pub timestamp: f64,
@@ -19,7 +19,7 @@ pub struct NewMetric {
 
 /// New metric key entry
 #[derive(Insertable, Debug)]
-#[table_name = "metric_keys"]
+#[diesel(table_name = metric_keys)]
 pub struct NewMetricKey<'a> {
     /// Actual key
     pub key: Cow<'a, str>,
@@ -47,7 +47,7 @@ impl<'a> MetricKey<'a> {
         key_name: &str,
         unit: Option<Unit>,
         description: Option<&'a str>,
-        db: &SqliteConnection,
+        db: &mut SqliteConnection,
     ) -> Result<MetricKey<'a>> {
         let key = Self::key_by_name(key_name, db)?;
         let unit_value = unit
@@ -61,7 +61,7 @@ impl<'a> MetricKey<'a> {
         id_value: i64,
         unit_value: Cow<'a, str>,
         description_value: Cow<'a, str>,
-        db: &SqliteConnection,
+        db: &mut SqliteConnection,
     ) -> Result<()> {
         use crate::schema::metric_keys::dsl::*;
         diesel::update(metric_keys.filter(id.eq(id_value)))
@@ -69,7 +69,7 @@ impl<'a> MetricKey<'a> {
             .execute(db)?;
         Ok(())
     }
-    pub(crate) fn key_by_name(key_name: &str, db: &SqliteConnection) -> Result<MetricKey<'a>> {
+    pub(crate) fn key_by_name(key_name: &str, db: &mut SqliteConnection) -> Result<MetricKey<'a>> {
         use crate::schema::metric_keys::dsl::metric_keys;
         match Self::key_by_name_inner(key_name, db) {
             Ok(key) => Ok(key),
@@ -87,7 +87,7 @@ impl<'a> MetricKey<'a> {
             Err(e) => Err(e),
         }
     }
-    fn key_by_name_inner(key_name: &str, db: &SqliteConnection) -> Result<MetricKey<'a>> {
+    fn key_by_name_inner(key_name: &str, db: &mut SqliteConnection) -> Result<MetricKey<'a>> {
         use crate::schema::metric_keys::dsl::*;
         let query = metric_keys.filter(key.eq(key_name));
         let keys = query.load::<MetricKey>(db)?;
@@ -99,7 +99,7 @@ impl<'a> MetricKey<'a> {
 
 /// Metric model for existing entries in sqlite database
 #[derive(Queryable, Debug, Identifiable, Associations)]
-#[belongs_to(MetricKey<'_>)]
+#[diesel(belongs_to(MetricKey<'_>))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Metric {
     /// Unique ID of sample

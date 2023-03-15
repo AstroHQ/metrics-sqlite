@@ -1,7 +1,7 @@
 use metrics_sqlite::MetricsDb;
 
 fn main() {
-    let db = MetricsDb::new("metrics.db").unwrap();
+    let mut db = MetricsDb::new("metrics.db").unwrap();
     println!("Keys: {}", db.available_keys().unwrap().join(", "));
     let sessions = db.sessions();
     for (i, s) in sessions.iter().enumerate() {

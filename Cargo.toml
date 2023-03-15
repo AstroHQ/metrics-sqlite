@@ -12,10 +12,10 @@ documentation = "https://docs.rs/metrics-sqlite"
 repository = "https://github.com/AstroHQ/metrics-sqlite/"
 
 [dependencies]
-diesel = { version = "1.4", features = ["sqlite"] }
-diesel_migrations = "1.4"
+diesel = { version = "2.0.3", features = ["sqlite"] }
+diesel_migrations = "2.0.0"
 # this seems to let us force bundled sqlite in diesel
-libsqlite3-sys = { version = "0.18", features = ["bundled"] }
+libsqlite3-sys = { version = "0.25.2", features = ["bundled"] }
 metrics = "0.14"
 thiserror = "1.0"
 log = "0.4"
