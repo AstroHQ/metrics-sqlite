@@ -11,9 +11,10 @@ extern crate log;
 use diesel::prelude::*;
 use diesel::{insert_into, sql_query};
 
-use metrics::{GaugeValue, Key, SetRecorderError, Unit};
+use metrics::{GaugeValue, Key, KeyName, SetRecorderError, SharedString, Unit};
 
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
+use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
@@ -65,6 +66,7 @@ mod models;
 mod recorder;
 mod schema;
 
+use crate::recorder::Handle;
 pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, MetricKey, NewMetric};
 
@@ -89,8 +91,10 @@ enum RegisterType {
 
 enum Event {
     Stop,
-    RegisterKey(RegisterType, Key, Option<Unit>, Option<&'static str>),
+    DescribeKey(RegisterType, KeyName, Option<Unit>, SharedString),
+    RegisterKey(RegisterType, Key, Arc<Handle>),
     IncrementCounter(Duration, Key, u64),
+    AbsoluteCounter(Duration, Key, u64),
     UpdateGauge(Duration, Key, GaugeValue),
     UpdateHistogram(Duration, Key, f64),
     SetHousekeeping {
@@ -222,16 +226,20 @@ fn run_worker(
                         state.set_housekeeping(retention_period, housekeeping_period, record_limit);
                         (false, false)
                     }
-                    Ok(Event::RegisterKey(_key_type, key, unit, desc)) => {
-                        info!("Registering {:?}", key);
+                    Ok(Event::DescribeKey(_key_type, key, unit, desc)) => {
+                        info!("Describing key {:?}", key);
                         if let Err(e) = MetricKey::create_or_update(
-                            &key.name().to_string(),
+                            &key.as_str(),
                             unit,
-                            desc,
+                            Some(desc.as_ref()),
                             &mut state.db,
                         ) {
                             error!("Failed to create key entry: {:?}", e);
                         }
+                        (false, false)
+                    }
+                    Ok(Event::RegisterKey(_key_type, _key, _handle)) => {
+                        // we currently don't do anything with register...
                         (false, false)
                     }
                     Ok(Event::IncrementCounter(timestamp, key, value)) => {
@@ -245,6 +253,14 @@ fn run_worker(
                             error!("Error queueing metric: {:?}", e);
                         }
 
+                        (state.should_flush(), false)
+                    }
+                    Ok(Event::AbsoluteCounter(timestamp, key, value)) => {
+                        let key_str = key.name().to_string();
+                        state.counters.insert(key, value);
+                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                            error!("Error queueing metric: {:?}", e);
+                        }
                         (state.should_flush(), false)
                     }
                     Ok(Event::UpdateGauge(timestamp, key, value)) => {

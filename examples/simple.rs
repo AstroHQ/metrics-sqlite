@@ -19,8 +19,12 @@ fn main() {
         .filter(None, log::LevelFilter::Trace)
         .init();
     setup_metrics();
-    metrics::register_counter!("video.counter");
-    metrics::register_gauge!("net.quality.rate", metrics::Unit::MegabitsPerSecond);
+    metrics::describe_counter!("video.counter", "video frames or something");
+    metrics::describe_gauge!(
+        "net.quality.rate",
+        metrics::Unit::MegabitsPerSecond,
+        "description here"
+    );
     loop {
         counter!("video.counter", 1);
         counter!("net.packets", 2);
