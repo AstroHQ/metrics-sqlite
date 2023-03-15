@@ -13,6 +13,7 @@ use diesel::{insert_into, sql_query};
 
 use metrics::{GaugeValue, Key, SetRecorderError, Unit};
 
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
@@ -31,10 +32,10 @@ const BACKGROUND_CHANNEL_LIMIT: usize = 8000;
 pub enum MetricsError {
     /// Error with database
     #[error("Database error: {0}")]
-    DbConnectionError(#[from] diesel::ConnectionError),
+    DbConnectionError(#[from] ConnectionError),
     /// Error migrating database
     #[error("Migration error: {0}")]
-    MigrationError(#[from] diesel_migrations::RunMigrationsError),
+    MigrationError(Box<dyn std::error::Error + Send + Sync>),
     /// Error querying metrics DB
     #[error("Error querying DB: {0}")]
     QueryError(#[from] diesel::result::Error),
@@ -67,15 +68,16 @@ mod schema;
 pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, MetricKey, NewMetric};
 
-embed_migrations!("migrations");
+pub(crate) const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     let url = path
         .as_ref()
         .to_str()
         .ok_or(MetricsError::InvalidDatabasePath)?;
-    let db = SqliteConnection::establish(url)?;
-    embedded_migrations::run(&db)?;
+    let mut db = SqliteConnection::establish(url)?;
+    db.run_pending_migrations(MIGRATIONS)
+        .map_err(|e| MetricsError::MigrationError(e))?;
 
     Ok(db)
 }
@@ -150,7 +152,7 @@ impl InnerState {
         }
     }
     fn housekeep(&mut self) -> Result<(), diesel::result::Error> {
-        SqliteExporter::housekeeping(&self.db, self.retention, self.record_limit, false);
+        SqliteExporter::housekeeping(&mut self.db, self.retention, self.record_limit, false);
         self.last_housekeeping = Instant::now();
         Ok(())
     }
@@ -165,9 +167,9 @@ impl InnerState {
     fn flush(&mut self) -> Result<(), diesel::result::Error> {
         use crate::schema::metrics::dsl::metrics;
         // trace!("Flushing {} records", self.queue.len());
-        let db = &self.db;
+        let db = &mut self.db;
         let queue = self.queue.drain(..);
-        db.transaction::<_, diesel::result::Error, _>(|| {
+        db.transaction::<_, diesel::result::Error, _>(|db| {
             for rec in queue {
                 insert_into(metrics).values(&rec).execute(db)?;
             }
@@ -181,7 +183,7 @@ impl InnerState {
             Some(key) => *key,
             None => {
                 debug!("Looking up {}", key);
-                let key_id = MetricKey::key_by_name(key, &self.db)?.id;
+                let key_id = MetricKey::key_by_name(key, &mut self.db)?.id;
                 self.key_ids.insert(key.to_string(), key_id);
                 key_id
             }
@@ -226,7 +228,7 @@ fn run_worker(
                             &key.name().to_string(),
                             unit,
                             desc,
-                            &state.db,
+                            &mut state.db,
                         ) {
                             error!("Failed to create key entry: {:?}", e);
                         }
@@ -313,8 +315,8 @@ impl SqliteExporter {
         keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
-        let db = setup_db(path)?;
-        Self::housekeeping(&db, keep_duration, None, true);
+        let mut db = setup_db(path)?;
+        Self::housekeeping(&mut db, keep_duration, None, true);
         let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
         let thread = run_worker(db, receiver, flush_interval);
         let exporter = SqliteExporter {
@@ -347,7 +349,7 @@ impl SqliteExporter {
     ///
     /// Does nothing if None was given for keep_duration in `new()`
     fn housekeeping(
-        db: &SqliteConnection,
+        db: &mut SqliteConnection,
         keep_duration: Option<Duration>,
         record_limit: Option<usize>,
         vacuum: bool,

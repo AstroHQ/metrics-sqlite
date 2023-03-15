@@ -19,6 +19,7 @@ pub struct DerivMetric {
     pub value: f64,
 }
 /// Describes a session, which is a sub-set of metrics data based on time gaps
+#[derive(Debug, Copy, Clone)]
 pub struct Session {
     /// Timestamp session starts at
     pub start_time: f64,
@@ -46,17 +47,17 @@ pub struct MetricsDb {
 impl MetricsDb {
     /// Creates a new metrics DB with given path of a SQLite database
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = setup_db(path)?;
-        let sessions = Self::process_sessions(&db)?;
+        let mut db = setup_db(path)?;
+        let sessions = Self::process_sessions(&mut db)?;
         Ok(MetricsDb { db, sessions })
     }
 
     /// Returns sessions in database, based on `SESSION_TIME_GAP_THRESHOLD`
-    pub fn sessions(&self) -> &[Session] {
-        &self.sessions
+    pub fn sessions(&self) -> Vec<Session> {
+        self.sessions.clone()
     }
 
-    fn process_sessions(db: &SqliteConnection) -> Result<Vec<Session>> {
+    fn process_sessions(db: &mut SqliteConnection) -> Result<Vec<Session>> {
         use crate::schema::metrics::dsl::*;
         let timestamps = metrics
             .select(timestamp)
@@ -83,18 +84,18 @@ impl MetricsDb {
     }
 
     /// Returns list of metrics keys stored in the database
-    pub fn available_keys(&self) -> Result<Vec<String>> {
+    pub fn available_keys(&mut self) -> Result<Vec<String>> {
         use crate::schema::metric_keys::dsl::*;
         let r = metric_keys
             .select(key)
             .distinct()
-            .load::<String>(&self.db)?;
+            .load::<String>(&mut self.db)?;
         Ok(r)
     }
 
     /// Returns all metrics for given key in ascending timestamp order
     pub fn metrics_for_key(
-        &self,
+        &mut self,
         key_name: &str,
         session: Option<&Session>,
     ) -> Result<Vec<Metric>> {
@@ -107,16 +108,16 @@ impl MetricsDb {
             Some(session) => query
                 .filter(timestamp.ge(session.start_time))
                 .filter(timestamp.le(session.end_time))
-                .load::<Metric>(&self.db)?,
-            None => query.load::<Metric>(&self.db)?,
+                .load::<Metric>(&mut self.db)?,
+            None => query.load::<Metric>(&mut self.db)?,
         };
         Ok(r)
     }
 
-    fn metric_key_for_key(&self, key_name: &str) -> Result<MetricKey> {
+    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey> {
         use crate::schema::metric_keys::dsl::*;
         let query = metric_keys.filter(key.eq(key_name));
-        let keys = query.load::<MetricKey>(&self.db)?;
+        let keys = query.load::<MetricKey>(&mut self.db)?;
         keys.into_iter()
             .next()
             .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
@@ -126,7 +127,7 @@ impl MetricsDb {
     ///
     /// f(t) = (x(t + 1) - x(t)) / ((t+1) - (t)
     pub fn deriv_metrics_for_key(
-        &self,
+        &mut self,
         key_name: &str,
         session: Option<&Session>,
     ) -> Result<Vec<DerivMetric>> {
@@ -148,7 +149,7 @@ impl MetricsDb {
 
     /// Exports DB contents to CSV file
     #[cfg(feature = "export_csv")]
-    pub fn export_to_csv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    pub fn export_to_csv<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         use crate::schema::metric_keys::dsl::key;
         use crate::schema::metrics::dsl::*;
         use std::fs::File;
@@ -159,7 +160,7 @@ impl MetricsDb {
         let query = query
             .order(timestamp.asc())
             .select((id, timestamp, key, value));
-        for row in query.load::<JoinedMetric>(&self.db)? {
+        for row in query.load::<JoinedMetric>(&mut self.db)? {
             csv_writer.serialize(row)?;
         }
         csv_writer.flush()?;
