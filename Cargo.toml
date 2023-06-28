@@ -1,6 +1,6 @@
 [package]
 name = "metrics-sqlite"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
@@ -15,8 +15,8 @@ repository = "https://github.com/AstroHQ/metrics-sqlite/"
 diesel = { version = "2.0.3", features = ["sqlite"] }
 diesel_migrations = "2.0.0"
 # this seems to let us force bundled sqlite in diesel
-libsqlite3-sys = { version = "0.25.2", features = ["bundled"] }
-metrics = "0.20.1"
+libsqlite3-sys = { version = "0.26.0", features = ["bundled"] }
+metrics = "0.21.0"
 thiserror = "1.0"
 log = "0.4"
 csv = {version = "1.1.6", optional = true }
