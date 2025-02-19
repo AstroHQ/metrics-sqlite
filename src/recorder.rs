@@ -1,11 +1,13 @@
 use crate::{Event, RegisterType, SqliteExporter};
 use metrics::{
-    Counter, CounterFn, Gauge, GaugeFn, GaugeValue, Histogram, HistogramFn, Key, KeyName, Recorder,
-    SharedString, Unit,
+    Counter, CounterFn, Gauge, GaugeFn, GaugeValue, Histogram, HistogramFn, Key, KeyName, Metadata,
+    Recorder, SharedString, Unit,
 };
-use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::{
+    sync::{mpsc::SyncSender, Arc},
+    time::SystemTime,
+};
+use tracing::error;
 
 pub(crate) struct Handle {
     sender: SyncSender<Event>,
@@ -179,7 +181,7 @@ impl Recorder for SqliteExporter {
     }
 
     // in future we could record these to the SQLite database for informational/metadata usage
-    fn register_counter(&self, key: &Key) -> Counter {
+    fn register_counter(&self, key: &Key, _metadata: &Metadata) -> Counter {
         let sender = self.sender.clone();
         let handle = Arc::new(Handle {
             sender,
@@ -195,7 +197,7 @@ impl Recorder for SqliteExporter {
         Counter::from_arc(handle)
     }
 
-    fn register_gauge(&self, key: &Key) -> Gauge {
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata) -> Gauge {
         let sender = self.sender.clone();
         let handle = Arc::new(Handle {
             sender,
@@ -211,7 +213,7 @@ impl Recorder for SqliteExporter {
         Gauge::from_arc(handle)
     }
 
-    fn register_histogram(&self, key: &Key) -> Histogram {
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata) -> Histogram {
         let sender = self.sender.clone();
         let handle = Arc::new(Handle {
             sender,

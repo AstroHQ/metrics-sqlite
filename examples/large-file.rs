@@ -1,6 +1,8 @@
 use metrics::{counter, gauge};
 use metrics_sqlite::SqliteExporter;
 use std::time::Duration;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn setup_metrics() {
     let exporter = SqliteExporter::new(
@@ -15,9 +17,15 @@ fn setup_metrics() {
         .expect("Failed to install SqliteExporter");
 }
 fn main() {
-    pretty_env_logger::formatted_builder()
-        .filter(None, log::LevelFilter::Trace)
+    let fmt_layer = fmt::layer();
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
         .init();
+
     setup_metrics();
     metrics::describe_counter!("video.counter", "video frames");
     metrics::describe_gauge!(
@@ -27,13 +35,13 @@ fn main() {
     );
 
     loop {
-        gauge!("rate_control.previous_metered_throughput", 2134.0);
-        gauge!("rate_control.metered_throughput", 2134.0);
-        gauge!("rate_control.smoothed_rtt", 2133.0);
-        gauge!("rate_control.raw_rtt", 2341.0);
-        counter!("video.counter", 1);
-        counter!("net.packets", 2);
-        gauge!("net.quality.rate", 231.2);
+        gauge!("rate_control.previous_metered_throughput").set(2134.0);
+        gauge!("rate_control.metered_throughput").set(2134.0);
+        gauge!("rate_control.smoothed_rtt").set(2133.0);
+        gauge!("rate_control.raw_rtt").set(2341.0);
+        counter!("video.counter").increment(1);
+        counter!("net.packets").increment(2);
+        gauge!("net.quality.rate").set(231.2);
         // let start = std::time::Instant::now();
         std::thread::sleep(Duration::from_micros(1000));
         // timing!("net.time.delay", start, std::time::Instant::now());
