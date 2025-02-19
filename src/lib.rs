@@ -5,8 +5,7 @@
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
-#[macro_use]
-extern crate log;
+use tracing::{debug, error, info, trace, warn};
 
 use diesel::prelude::*;
 use diesel::{insert_into, sql_query};
@@ -424,8 +423,8 @@ impl SqliteExporter {
     }
 
     /// Install recorder as `metrics` crate's Recorder
-    pub fn install(self) -> Result<(), SetRecorderError> {
-        metrics::set_boxed_recorder(Box::new(self))
+    pub fn install(self) -> Result<(), SetRecorderError<Self>> {
+        metrics::set_global_recorder(self)
     }
 }
 impl Drop for SqliteExporter {
@@ -452,9 +451,9 @@ mod tests {
                 thread::spawn(move || {
                     let start = Instant::now();
                     loop {
-                        metrics::gauge!("rate", 1.0);
-                        metrics::increment_counter!("hits");
-                        metrics::histogram!("histogram", 5.0);
+                        metrics::gauge!("rate").set(1.0);
+                        metrics::counter!("hits").increment(1);
+                        metrics::histogram!("histogram").record(5.0);
                         if start.elapsed().as_secs() >= 5 {
                             break;
                         }
