@@ -24,7 +24,7 @@ serde = { version = "1.0.125", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-
+anyhow = "1.0.98"
 
 [features]
 default = []

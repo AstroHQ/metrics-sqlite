@@ -1,12 +1,12 @@
 //! Metrics DB, to use/query/etc metrics SQLite databases
-use super::{models::Metric, setup_db, Result};
-use crate::models::MetricKey;
-use crate::MetricsError;
+use super::{
+    models::{Metric, MetricKey},
+    setup_db, MetricsError, Result,
+};
 use diesel::prelude::*;
 #[cfg(feature = "import_csv")]
 use serde::Deserialize;
-use std::path::Path;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 /// Threshold to separate samples into sessions by
 const SESSION_TIME_GAP_THRESHOLD: Duration = Duration::from_secs(30);
@@ -18,7 +18,7 @@ pub struct DerivMetric {
     pub key: String,
     pub value: f64,
 }
-/// Describes a session, which is a sub-set of metrics data based on time gaps
+/// Describes a session, which is a subset of metrics data based on time gaps
 #[derive(Debug, Copy, Clone)]
 pub struct Session {
     /// Timestamp session starts at
@@ -29,7 +29,7 @@ pub struct Session {
     pub duration: Duration,
 }
 impl Session {
-    /// Creates a new session with given start & end, calculating duration from them
+    /// Creates a new session with given start and end, calculating duration from them
     pub fn new(start_time: f64, end_time: f64) -> Self {
         Session {
             start_time,
@@ -45,16 +45,30 @@ pub struct MetricsDb {
 }
 
 impl MetricsDb {
-    /// Creates a new metrics DB with given path of a SQLite database
+    /// Creates a new metrics DB with a given path of an SQLite database
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut db = setup_db(path)?;
         let sessions = Self::process_sessions(&mut db)?;
         Ok(MetricsDb { db, sessions })
     }
 
-    /// Returns sessions in database, based on `SESSION_TIME_GAP_THRESHOLD`
+    /// Returns sessions in the database, based on `SESSION_TIME_GAP_THRESHOLD`
     pub fn sessions(&self) -> Vec<Session> {
         self.sessions.clone()
+    }
+
+    /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
+    pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
+        use crate::schema::metrics::dsl::*;
+        let metric_key = self.metric_key_for_key(metric)?;
+        let query = metrics
+            .order(timestamp.desc())
+            .filter(metric_key_id.eq(metric_key.id))
+            .limit(1);
+        let start = query.first::<Metric>(&mut self.db)?;
+        let end_query = metrics.order(timestamp.desc()).limit(1);
+        let end = end_query.first::<Metric>(&mut self.db)?;
+        Ok(Session::new(start.timestamp, end.timestamp))
     }
 
     fn process_sessions(db: &mut SqliteConnection) -> Result<Vec<Session>> {
@@ -135,8 +149,7 @@ impl MetricsDb {
         let new_values: Vec<_> = m
             .windows(2)
             .map(|v| {
-                let new_value =
-                    (v[1].value - v[0].value) / (v[1].timestamp - v[0].timestamp);
+                let new_value = (v[1].value - v[0].value) / (v[1].timestamp - v[0].timestamp);
                 DerivMetric {
                     timestamp: v[1].timestamp,
                     key: format!("{}.deriv", key_name),
