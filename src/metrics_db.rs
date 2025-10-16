@@ -7,6 +7,8 @@ use diesel::prelude::*;
 #[cfg(feature = "import_csv")]
 use serde::Deserialize;
 use std::{path::Path, time::Duration};
+#[cfg(feature = "import_csv")]
+use tracing::{error, trace};
 
 /// Threshold to separate samples into sessions by
 const SESSION_TIME_GAP_THRESHOLD: Duration = Duration::from_secs(30);
@@ -128,7 +130,7 @@ impl MetricsDb {
         Ok(r)
     }
 
-    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey> {
+    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey<'_>> {
         use crate::schema::metric_keys::dsl::*;
         let query = metric_keys.filter(key.eq(key_name));
         let keys = query.load::<MetricKey>(&mut self.db)?;
@@ -149,10 +151,15 @@ impl MetricsDb {
         let new_values: Vec<_> = m
             .windows(2)
             .map(|v| {
-                let new_value = (v[1].value - v[0].value) / (v[1].timestamp - v[0].timestamp);
+                let dt = v[1].timestamp - v[0].timestamp;
+                let new_value = if dt > 0.0 {
+                    (v[1].value - v[0].value) / dt
+                } else {
+                    0.0
+                };
                 DerivMetric {
                     timestamp: v[1].timestamp,
-                    key: format!("{}.deriv", key_name),
+                    key: format!("{key_name}.deriv"),
                     value: new_value,
                 }
             })
@@ -211,7 +218,7 @@ impl MetricsDb {
                     error!("Skipping record due to error reading CSV record: {:?}", e);
                 }
             }
-            if flush_counter % 200 == 0 {
+            if flush_counter.is_multiple_of(200) {
                 trace!("Flushing");
                 inner.flush()?;
             }

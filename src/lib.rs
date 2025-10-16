@@ -39,7 +39,7 @@ pub enum MetricsError {
     /// Error querying metrics DB
     #[error("Error querying DB: {0}")]
     QueryError(#[from] diesel::result::Error),
-    /// Error if path given is invalid
+    /// Error if the path given is invalid
     #[error("Invalid database path")]
     InvalidDatabasePath,
     /// IO Error with reader/writer
@@ -50,7 +50,7 @@ pub enum MetricsError {
     #[cfg(feature = "csv")]
     #[error("CSV Error: {0}")]
     CsvError(#[from] csv::Error),
-    /// Attempted to query database but found no records
+    /// Attempted to query the database but found no records
     #[error("Database has no metrics stored in it")]
     EmptyDatabase,
     /// Given metric key name wasn't found in the DB
@@ -78,7 +78,7 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
         .ok_or(MetricsError::InvalidDatabasePath)?;
     let mut db = SqliteConnection::establish(url)?;
     db.run_pending_migrations(MIGRATIONS)
-        .map_err(|e| MetricsError::MigrationError(e))?;
+        .map_err(MetricsError::MigrationError)?;
 
     Ok(db)
 }
@@ -101,9 +101,40 @@ enum Event {
         housekeeping_period: Option<Duration>,
         record_limit: Option<usize>,
     },
+    RequestSummaryFromSignpost {
+        signpost_key: String,
+        keys: Vec<String>,
+        tx: tokio::sync::oneshot::Sender<Result<HashMap<String, f64>>>,
+    },
 }
 
-/// Exports metrics by storing them in a SQLite database at a periodic interval
+/// Handle for continued communication with sqlite exporter
+pub struct SqliteExporterHandle {
+    sender: SyncSender<Event>,
+}
+impl SqliteExporterHandle {
+    /// Request average metrics from a signpost to latest from exporter's DB
+    pub fn request_average_metrics(
+        &self,
+        from_signpost: &str,
+        with_keys: &[&str],
+    ) -> Result<HashMap<String, f64>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Event::RequestSummaryFromSignpost {
+                signpost_key: from_signpost.to_string(),
+                keys: with_keys.iter().map(|s| s.to_string()).collect(),
+                tx,
+            })
+            .unwrap();
+        match rx.blocking_recv() {
+            Ok(metrics) => Ok(metrics?),
+            Err(_) => Err(MetricsError::EmptyDatabase),
+        }
+    }
+}
+
+/// Exports metrics by storing them in an SQLite database at a periodic interval
 pub struct SqliteExporter {
     thread: Option<JoinHandle<()>>,
     sender: SyncSender<Event>,
@@ -199,6 +230,72 @@ impl InnerState {
         self.queue.push_back(metric);
         Ok(())
     }
+
+    // --- Summary/Average additions
+
+    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey<'_>> {
+        use crate::schema::metric_keys::dsl::*;
+        let query = metric_keys.filter(key.eq(key_name));
+        let keys = query.load::<MetricKey>(&mut self.db)?;
+        keys.into_iter()
+            .next()
+            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
+    }
+    /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
+    pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
+        use crate::schema::metrics::dsl::*;
+        let metric_key = self.metric_key_for_key(metric)?;
+        let query = metrics
+            .order(timestamp.desc())
+            .filter(metric_key_id.eq(metric_key.id))
+            .limit(1);
+        let start = query.first::<Metric>(&mut self.db)?;
+        let end_query = metrics.order(timestamp.desc()).limit(1);
+        let end = end_query.first::<Metric>(&mut self.db)?;
+        Ok(Session::new(start.timestamp, end.timestamp))
+    }
+    /// Returns all metrics for given key in ascending timestamp order
+    pub fn metrics_for_key(
+        &mut self,
+        key_name: &str,
+        session: Option<&Session>,
+    ) -> Result<Vec<Metric>> {
+        use crate::schema::metrics::dsl::*;
+        let metric_key = self.metric_key_for_key(key_name)?;
+        let query = metrics
+            .order(timestamp.asc())
+            .filter(metric_key_id.eq(metric_key.id));
+        let r = match session {
+            Some(session) => query
+                .filter(timestamp.ge(session.start_time))
+                .filter(timestamp.le(session.end_time))
+                .load::<Metric>(&mut self.db)?,
+            None => query.load::<Metric>(&mut self.db)?,
+        };
+        Ok(r)
+    }
+    fn average(&mut self, key: &str, session: &Session) -> Result<f64> {
+        let metrics = self.metrics_for_key(key, Some(session))?;
+        let sum: f64 = metrics.iter().map(|m| m.value).sum();
+        let samples = metrics.len();
+        let average = sum / samples as f64;
+        Ok(average)
+    }
+    pub fn metrics_summary_for_signpost_and_keys(
+        &mut self,
+        signpost: String,
+        metrics: Vec<String>,
+    ) -> Result<HashMap<String, f64>> {
+        let session = self.session_from_signpost(&signpost)?;
+        let mut results = HashMap::new();
+        for key in metrics {
+            let value = self.average(&key, &session)?;
+            results.insert(key, value);
+        }
+        let duration_secs = session.end_time - session.start_time;
+        results.insert("session.duration".to_string(), duration_secs);
+        Ok(results)
+    }
 }
 
 fn run_worker(
@@ -292,6 +389,25 @@ fn run_worker(
 
                         (state.should_flush(), false)
                     }
+                    Ok(Event::RequestSummaryFromSignpost {
+                        signpost_key,
+                        keys,
+                        tx,
+                    }) => {
+                        match state.metrics_summary_for_signpost_and_keys(signpost_key, keys) {
+                            Ok(metrics) => {
+                                if tx.send(Ok(metrics)).is_err() {
+                                    error!("Failed to respond with metrics results, discarding");
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(e) = tx.send(Err(e)) {
+                                    error!("Failed to respond with metrics error result, discarding: {e:?}");
+                                }
+                            }
+                        }
+                        (false, false)
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         debug!("Flushing due to {}s timeout", flush_duration.as_secs());
                         (true, false)
@@ -320,7 +436,7 @@ fn run_worker(
 }
 
 impl SqliteExporter {
-    /// Creates a new `SqliteExporter` that stores metrics in a SQLite database file.
+    /// Creates a new `SqliteExporter` that stores metrics in an SQLite database file.
     ///
     /// `flush_interval` specifies how often metrics are flushed to SQLite/disk
     ///
@@ -341,10 +457,10 @@ impl SqliteExporter {
         Ok(exporter)
     }
 
-    /// Sets optional periodic house keeping, None to disable (disabled by default)
+    /// Sets optional periodic housekeeping, None to disable (disabled by default)
     /// ## Notes
-    /// Periodic house keeping can affect metric recording, causing some data to be dropped during house keeping.
-    /// Record limit if set will cause anything over limit + 25% of limit to be removed
+    /// Periodic housekeeping can affect metric recording, causing some data to be dropped during housekeeping.
+    /// Record limit if set will cause anything over limit + 25% of the limit to be removed
     pub fn set_periodic_housekeeping(
         &self,
         periodic_duration: Option<Duration>,
@@ -409,7 +525,7 @@ impl SqliteExporter {
                             record_limit,
                             excess
                         );
-                        let query = format!("DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {});", excess);
+                        let query = format!("DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {excess});");
                         if let Err(e) = sql_query(query).execute(db) {
                             error!("Failed to delete excessive records: {:?}", e);
                         }
@@ -423,8 +539,12 @@ impl SqliteExporter {
     }
 
     /// Install recorder as `metrics` crate's Recorder
-    pub fn install(self) -> Result<(), SetRecorderError<Self>> {
-        metrics::set_global_recorder(self)
+    pub fn install(self) -> Result<SqliteExporterHandle, SetRecorderError<Self>> {
+        let handle = SqliteExporterHandle {
+            sender: self.sender.clone(),
+        };
+        metrics::set_global_recorder(self)?;
+        Ok(handle)
     }
 }
 impl Drop for SqliteExporter {

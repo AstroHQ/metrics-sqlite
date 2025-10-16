@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     let throughput = average(&mut db, "net_quality.throughput", &session)? / 1024.0; // KB/s
     let metered_throughput =
         average(&mut db, "rate_control.metered_throughput", &session)? / 1024.0; // KB/s
-    println!("Last connection: {:#?}", session);
+    println!("Last connection: {session:#?}");
     println!("RTT: Average {rtt:.2}ms");
     println!("Throughput: Average {throughput:.2}KB/s");
     println!("Metered: Average {metered_throughput:.2}KB/s");
