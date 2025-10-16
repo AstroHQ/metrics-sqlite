@@ -61,7 +61,7 @@ impl MetricsDb {
         self.sessions.clone()
     }
 
-    /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
+    /// Returns a session (timestamp range) from the first occurrence of the signpost to the latest metric
     pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
         query::session_from_signpost(&mut self.db, metric)
     }

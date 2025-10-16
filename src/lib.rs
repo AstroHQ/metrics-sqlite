@@ -59,6 +59,12 @@ pub enum MetricsError {
     /// Attempting to communicate with exporter but it's gone away
     #[error("Exporter task has been stopped or crashed")]
     ExporterUnavailable,
+    /// Session derived from the signpost has zero duration
+    #[error("Session for signpost `{0}` has zero duration")]
+    ZeroLengthSession(String),
+    /// No metrics available for the requested key inside the derived session
+    #[error("No metrics recorded for `{0}` in requested session")]
+    NoMetricsForKey(String),
 }
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
@@ -133,7 +139,7 @@ impl SqliteExporterHandle {
             .map_err(|_| MetricsError::ExporterUnavailable)?;
         match rx.blocking_recv() {
             Ok(metrics) => Ok(metrics?),
-            Err(_) => Err(MetricsError::EmptyDatabase),
+            Err(_) => Err(MetricsError::ExporterUnavailable),
         }
     }
 }
@@ -237,18 +243,6 @@ impl InnerState {
 
     // --- Summary/Average additions
 
-    // /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
-    // pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
-    //     query::session_from_signpost(&mut self.db, metric)
-    // }
-    // /// Returns all metrics for given key in ascending timestamp order
-    // pub fn metrics_for_key(
-    //     &mut self,
-    //     key_name: &str,
-    //     session: Option<&Session>,
-    // ) -> Result<Vec<Metric>> {
-    //     query::metrics_for_key(&mut self.db, key_name, session)
-    // }
     pub fn metrics_summary_for_signpost_and_keys(
         &mut self,
         signpost: String,

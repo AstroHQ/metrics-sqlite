@@ -18,12 +18,15 @@ pub(crate) fn session_from_signpost(db: &mut SqliteConnection, metric: &str) -> 
     use crate::schema::metrics::dsl::*;
     let metric_key = metric_key_for_name(db, metric)?;
     let query = metrics
-        .order(timestamp.desc())
+        .order(timestamp.asc())
         .filter(metric_key_id.eq(metric_key.id))
         .limit(1);
     let start = query.first::<Metric>(db)?;
     let end_query = metrics.order(timestamp.desc()).limit(1);
     let end = end_query.first::<Metric>(db)?;
+    if end.timestamp <= start.timestamp {
+        return Err(MetricsError::ZeroLengthSession(metric.to_string()));
+    }
     Ok(Session::new(start.timestamp, end.timestamp))
 }
 
@@ -53,6 +56,9 @@ pub(crate) fn average_for_session(
     session: &Session,
 ) -> Result<f64> {
     let metrics = metrics_for_key(db, key_name, Some(session))?;
+    if metrics.is_empty() {
+        return Err(MetricsError::NoMetricsForKey(key_name.to_string()));
+    }
     let sum: f64 = metrics.iter().map(|m| m.value).sum();
     let samples = metrics.len();
     let average = sum / samples as f64;
