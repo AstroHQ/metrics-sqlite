@@ -1,12 +1,14 @@
 //! Metrics DB, to use/query/etc metrics SQLite databases
-use super::{models::Metric, setup_db, Result};
-use crate::models::MetricKey;
-use crate::MetricsError;
+use super::{
+    models::{Metric, MetricKey},
+    setup_db, MetricsError, Result,
+};
 use diesel::prelude::*;
 #[cfg(feature = "import_csv")]
 use serde::Deserialize;
-use std::path::Path;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
+#[cfg(feature = "import_csv")]
+use tracing::{error, trace};
 
 /// Threshold to separate samples into sessions by
 const SESSION_TIME_GAP_THRESHOLD: Duration = Duration::from_secs(30);
@@ -18,7 +20,7 @@ pub struct DerivMetric {
     pub key: String,
     pub value: f64,
 }
-/// Describes a session, which is a sub-set of metrics data based on time gaps
+/// Describes a session, which is a subset of metrics data based on time gaps
 #[derive(Debug, Copy, Clone)]
 pub struct Session {
     /// Timestamp session starts at
@@ -29,7 +31,7 @@ pub struct Session {
     pub duration: Duration,
 }
 impl Session {
-    /// Creates a new session with given start & end, calculating duration from them
+    /// Creates a new session with given start and end, calculating duration from them
     pub fn new(start_time: f64, end_time: f64) -> Self {
         Session {
             start_time,
@@ -38,6 +40,8 @@ impl Session {
         }
     }
 }
+pub(crate) mod query;
+
 /// Metrics database, useful for querying stored metrics
 pub struct MetricsDb {
     db: SqliteConnection,
@@ -45,16 +49,21 @@ pub struct MetricsDb {
 }
 
 impl MetricsDb {
-    /// Creates a new metrics DB with given path of a SQLite database
+    /// Creates a new metrics DB with a given path of an SQLite database
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut db = setup_db(path)?;
         let sessions = Self::process_sessions(&mut db)?;
         Ok(MetricsDb { db, sessions })
     }
 
-    /// Returns sessions in database, based on `SESSION_TIME_GAP_THRESHOLD`
+    /// Returns sessions in the database, based on `SESSION_TIME_GAP_THRESHOLD`
     pub fn sessions(&self) -> Vec<Session> {
         self.sessions.clone()
+    }
+
+    /// Returns a session (timestamp range) from the first occurrence of the signpost to the latest metric
+    pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
+        query::session_from_signpost(&mut self.db, metric)
     }
 
     fn process_sessions(db: &mut SqliteConnection) -> Result<Vec<Session>> {
@@ -99,28 +108,7 @@ impl MetricsDb {
         key_name: &str,
         session: Option<&Session>,
     ) -> Result<Vec<Metric>> {
-        use crate::schema::metrics::dsl::*;
-        let metric_key = self.metric_key_for_key(key_name)?;
-        let query = metrics
-            .order(timestamp.asc())
-            .filter(metric_key_id.eq(metric_key.id));
-        let r = match session {
-            Some(session) => query
-                .filter(timestamp.ge(session.start_time))
-                .filter(timestamp.le(session.end_time))
-                .load::<Metric>(&mut self.db)?,
-            None => query.load::<Metric>(&mut self.db)?,
-        };
-        Ok(r)
-    }
-
-    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey> {
-        use crate::schema::metric_keys::dsl::*;
-        let query = metric_keys.filter(key.eq(key_name));
-        let keys = query.load::<MetricKey>(&mut self.db)?;
-        keys.into_iter()
-            .next()
-            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
+        query::metrics_for_key(&mut self.db, key_name, session)
     }
 
     /// Returns rate of change, the derivative, of the given metrics key's values
@@ -135,11 +123,15 @@ impl MetricsDb {
         let new_values: Vec<_> = m
             .windows(2)
             .map(|v| {
-                let new_value =
-                    (v[1].value - v[0].value) / (v[1].timestamp - v[0].timestamp);
+                let dt = v[1].timestamp - v[0].timestamp;
+                let new_value = if dt > 0.0 {
+                    (v[1].value - v[0].value) / dt
+                } else {
+                    0.0
+                };
                 DerivMetric {
                     timestamp: v[1].timestamp,
-                    key: format!("{}.deriv", key_name),
+                    key: format!("{key_name}.deriv"),
                     value: new_value,
                 }
             })
@@ -198,7 +190,7 @@ impl MetricsDb {
                     error!("Skipping record due to error reading CSV record: {:?}", e);
                 }
             }
-            if flush_counter % 200 == 0 {
+            if flush_counter.is_multiple_of(200) {
                 trace!("Flushing");
                 inner.flush()?;
             }
