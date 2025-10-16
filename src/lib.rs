@@ -56,6 +56,9 @@ pub enum MetricsError {
     /// Given metric key name wasn't found in the DB
     #[error("Metric key {0} not found in database")]
     KeyNotFound(String),
+    /// Attempting to communicate with exporter but it's gone away
+    #[error("Exporter task has been stopped or crashed")]
+    ExporterUnavailable,
 }
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
@@ -65,6 +68,7 @@ mod models;
 mod recorder;
 mod schema;
 
+use crate::metrics_db::query;
 use crate::recorder::Handle;
 pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, MetricKey, NewMetric};
@@ -126,7 +130,7 @@ impl SqliteExporterHandle {
                 keys: with_keys.iter().map(|s| s.to_string()).collect(),
                 tx,
             })
-            .unwrap();
+            .map_err(|_| MetricsError::ExporterUnavailable)?;
         match rx.blocking_recv() {
             Ok(metrics) => Ok(metrics?),
             Err(_) => Err(MetricsError::EmptyDatabase),
@@ -233,68 +237,24 @@ impl InnerState {
 
     // --- Summary/Average additions
 
-    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey<'_>> {
-        use crate::schema::metric_keys::dsl::*;
-        let query = metric_keys.filter(key.eq(key_name));
-        let keys = query.load::<MetricKey>(&mut self.db)?;
-        keys.into_iter()
-            .next()
-            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
-    }
-    /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
-    pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
-        use crate::schema::metrics::dsl::*;
-        let metric_key = self.metric_key_for_key(metric)?;
-        let query = metrics
-            .order(timestamp.desc())
-            .filter(metric_key_id.eq(metric_key.id))
-            .limit(1);
-        let start = query.first::<Metric>(&mut self.db)?;
-        let end_query = metrics.order(timestamp.desc()).limit(1);
-        let end = end_query.first::<Metric>(&mut self.db)?;
-        Ok(Session::new(start.timestamp, end.timestamp))
-    }
-    /// Returns all metrics for given key in ascending timestamp order
-    pub fn metrics_for_key(
-        &mut self,
-        key_name: &str,
-        session: Option<&Session>,
-    ) -> Result<Vec<Metric>> {
-        use crate::schema::metrics::dsl::*;
-        let metric_key = self.metric_key_for_key(key_name)?;
-        let query = metrics
-            .order(timestamp.asc())
-            .filter(metric_key_id.eq(metric_key.id));
-        let r = match session {
-            Some(session) => query
-                .filter(timestamp.ge(session.start_time))
-                .filter(timestamp.le(session.end_time))
-                .load::<Metric>(&mut self.db)?,
-            None => query.load::<Metric>(&mut self.db)?,
-        };
-        Ok(r)
-    }
-    fn average(&mut self, key: &str, session: &Session) -> Result<f64> {
-        let metrics = self.metrics_for_key(key, Some(session))?;
-        let sum: f64 = metrics.iter().map(|m| m.value).sum();
-        let samples = metrics.len();
-        let average = sum / samples as f64;
-        Ok(average)
-    }
+    // /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
+    // pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
+    //     query::session_from_signpost(&mut self.db, metric)
+    // }
+    // /// Returns all metrics for given key in ascending timestamp order
+    // pub fn metrics_for_key(
+    //     &mut self,
+    //     key_name: &str,
+    //     session: Option<&Session>,
+    // ) -> Result<Vec<Metric>> {
+    //     query::metrics_for_key(&mut self.db, key_name, session)
+    // }
     pub fn metrics_summary_for_signpost_and_keys(
         &mut self,
         signpost: String,
         metrics: Vec<String>,
     ) -> Result<HashMap<String, f64>> {
-        let session = self.session_from_signpost(&signpost)?;
-        let mut results = HashMap::new();
-        for key in metrics {
-            let value = self.average(&key, &session)?;
-            results.insert(key, value);
-        }
-        let duration_secs = session.end_time - session.start_time;
-        results.insert("session.duration".to_string(), duration_secs);
-        Ok(results)
+        query::metrics_summary_for_signpost_and_keys(&mut self.db, &signpost, metrics)
     }
 }
 
@@ -394,15 +354,34 @@ fn run_worker(
                         keys,
                         tx,
                     }) => {
-                        match state.metrics_summary_for_signpost_and_keys(signpost_key, keys) {
-                            Ok(metrics) => {
-                                if tx.send(Ok(metrics)).is_err() {
-                                    error!("Failed to respond with metrics results, discarding");
+                        match state.flush() {
+                            Ok(()) => match state
+                                .metrics_summary_for_signpost_and_keys(signpost_key, keys)
+                            {
+                                Ok(metrics) => {
+                                    if tx.send(Ok(metrics)).is_err() {
+                                        error!(
+                                            "Failed to respond with metrics results, discarding"
+                                        );
+                                    }
                                 }
-                            }
+                                Err(e) => {
+                                    if let Err(e) = tx.send(Err(e)) {
+                                        error!(
+                                            "Failed to respond with metrics error result, discarding: {e:?}"
+                                        );
+                                    }
+                                }
+                            },
                             Err(e) => {
-                                if let Err(e) = tx.send(Err(e)) {
-                                    error!("Failed to respond with metrics error result, discarding: {e:?}");
+                                let err = MetricsError::from(e);
+                                error!(
+                                    "Failed to flush pending metrics before summary request: {err:?}"
+                                );
+                                if let Err(send_err) = tx.send(Err(err)) {
+                                    error!(
+                                        "Failed to respond with metrics flush error result, discarding: {send_err:?}"
+                                    );
                                 }
                             }
                         }

@@ -40,6 +40,8 @@ impl Session {
         }
     }
 }
+pub(crate) mod query;
+
 /// Metrics database, useful for querying stored metrics
 pub struct MetricsDb {
     db: SqliteConnection,
@@ -61,16 +63,7 @@ impl MetricsDb {
 
     /// Returns a session (timestamp range) based on the most recent of given metric as a signpost
     pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
-        use crate::schema::metrics::dsl::*;
-        let metric_key = self.metric_key_for_key(metric)?;
-        let query = metrics
-            .order(timestamp.desc())
-            .filter(metric_key_id.eq(metric_key.id))
-            .limit(1);
-        let start = query.first::<Metric>(&mut self.db)?;
-        let end_query = metrics.order(timestamp.desc()).limit(1);
-        let end = end_query.first::<Metric>(&mut self.db)?;
-        Ok(Session::new(start.timestamp, end.timestamp))
+        query::session_from_signpost(&mut self.db, metric)
     }
 
     fn process_sessions(db: &mut SqliteConnection) -> Result<Vec<Session>> {
@@ -115,28 +108,7 @@ impl MetricsDb {
         key_name: &str,
         session: Option<&Session>,
     ) -> Result<Vec<Metric>> {
-        use crate::schema::metrics::dsl::*;
-        let metric_key = self.metric_key_for_key(key_name)?;
-        let query = metrics
-            .order(timestamp.asc())
-            .filter(metric_key_id.eq(metric_key.id));
-        let r = match session {
-            Some(session) => query
-                .filter(timestamp.ge(session.start_time))
-                .filter(timestamp.le(session.end_time))
-                .load::<Metric>(&mut self.db)?,
-            None => query.load::<Metric>(&mut self.db)?,
-        };
-        Ok(r)
-    }
-
-    fn metric_key_for_key(&mut self, key_name: &str) -> Result<MetricKey<'_>> {
-        use crate::schema::metric_keys::dsl::*;
-        let query = metric_keys.filter(key.eq(key_name));
-        let keys = query.load::<MetricKey>(&mut self.db)?;
-        keys.into_iter()
-            .next()
-            .ok_or_else(|| MetricsError::KeyNotFound(key_name.to_string()))
+        query::metrics_for_key(&mut self.db, key_name, session)
     }
 
     /// Returns rate of change, the derivative, of the given metrics key's values
