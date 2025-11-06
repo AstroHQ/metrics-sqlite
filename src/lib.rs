@@ -92,12 +92,10 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     let mut db = SqliteConnection::establish(url)?;
 
     // Enable WAL mode for better concurrent access
-    sql_query("PRAGMA journal_mode=WAL;")
-        .execute(&mut db)?;
+    sql_query("PRAGMA journal_mode=WAL;").execute(&mut db)?;
 
     // Set busy timeout to 5 seconds to handle lock contention gracefully
-    sql_query("PRAGMA busy_timeout = 5000;")
-        .execute(&mut db)?;
+    sql_query("PRAGMA busy_timeout = 5000;").execute(&mut db)?;
 
     db.run_pending_migrations(MIGRATIONS)
         .map_err(MetricsError::MigrationError)?;
@@ -243,7 +241,7 @@ impl InnerState {
                 Ok(())
             }
             Err(e) => {
-                self.queue.extend(drain_buffer.into_iter());
+                self.queue.extend(drain_buffer);
                 Err(e)
             }
         }
