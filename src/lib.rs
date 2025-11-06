@@ -26,6 +26,9 @@ use thiserror::Error;
 /// Max number of items allowed in worker's queue before flushing regardless of flush duration
 const FLUSH_QUEUE_LIMIT: usize = 1000;
 const BACKGROUND_CHANNEL_LIMIT: usize = 8000;
+const SQLITE_DEFAULT_MAX_VARIABLES: usize = 999;
+const METRIC_FIELDS_PER_ROW: usize = 3;
+const INSERT_BATCH_SIZE: usize = SQLITE_DEFAULT_MAX_VARIABLES / METRIC_FIELDS_PER_ROW;
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
@@ -87,6 +90,15 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
         .to_str()
         .ok_or(MetricsError::InvalidDatabasePath)?;
     let mut db = SqliteConnection::establish(url)?;
+
+    // Enable WAL mode for better concurrent access
+    sql_query("PRAGMA journal_mode=WAL;")
+        .execute(&mut db)?;
+
+    // Set busy timeout to 5 seconds to handle lock contention gracefully
+    sql_query("PRAGMA busy_timeout = 5000;")
+        .execute(&mut db)?;
+
     db.run_pending_migrations(MIGRATIONS)
         .map_err(MetricsError::MigrationError)?;
 
@@ -202,10 +214,12 @@ impl InnerState {
     }
     fn should_flush(&self) -> bool {
         if self.last_flush.elapsed() > self.flush_duration {
-            debug!("Flushing due to {}s timeout", self.flush_duration.as_secs());
+            true
+        } else if self.queue.len() >= FLUSH_QUEUE_LIMIT {
+            debug!("Flushing due to queue size ({} items)", self.queue.len());
             true
         } else {
-            self.queue.len() >= FLUSH_QUEUE_LIMIT
+            false
         }
     }
     fn flush(&mut self) -> Result<(), diesel::result::Error> {
@@ -214,15 +228,25 @@ impl InnerState {
             self.last_flush = Instant::now();
             return Ok(());
         }
-        let mut drain_buffer: Vec<NewMetric> = self.queue.drain(..).collect();
+        let drain_buffer: Vec<NewMetric> = self.queue.drain(..).collect();
         let db = &mut self.db;
-        db.transaction::<_, diesel::result::Error, _>(|db| {
-            insert_into(metrics).values(&drain_buffer).execute(db)?;
+        let transaction_result = db.transaction::<_, diesel::result::Error, _>(|db| {
+            let chunk_size = INSERT_BATCH_SIZE.max(1);
+            for chunk in drain_buffer.chunks(chunk_size) {
+                insert_into(metrics).values(chunk).execute(db)?;
+            }
             Ok(())
-        })?;
-        drain_buffer.clear();
-        self.last_flush = Instant::now();
-        Ok(())
+        });
+        match transaction_result {
+            Ok(()) => {
+                self.last_flush = Instant::now();
+                Ok(())
+            }
+            Err(e) => {
+                self.queue.extend(drain_buffer.into_iter());
+                Err(e)
+            }
+        }
     }
     fn queue_metric(&mut self, timestamp: Duration, key: &str, value: f64) -> Result<()> {
         let metric_key_id = match self.key_ids.get(key) {
@@ -265,6 +289,9 @@ fn run_worker(
             let mut state = InnerState::new(flush_duration, db);
             info!("SQLite worker started");
             loop {
+                // Check if we need to flush based on elapsed time
+                let time_based_flush = state.last_flush.elapsed() >= flush_duration;
+
                 let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
                     Ok(Event::Stop) => {
                         info!("Stopping SQLiteExporter worker, flushing & exiting");
@@ -384,7 +411,6 @@ fn run_worker(
                         (false, false)
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        debug!("Flushing due to {}s timeout", flush_duration.as_secs());
                         (true, false)
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -392,7 +418,12 @@ fn run_worker(
                         (true, true)
                     }
                 };
-                if should_flush {
+
+                // Flush if time-based flush is triggered OR if event-based flush is triggered
+                if time_based_flush || should_flush {
+                    if time_based_flush {
+                        debug!("Flushing due to elapsed time ({}s)", flush_duration.as_secs());
+                    }
                     if let Err(e) = state.flush() {
                         error!("Error flushing metrics: {}", e);
                     }
