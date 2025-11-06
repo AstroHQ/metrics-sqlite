@@ -210,15 +210,17 @@ impl InnerState {
     }
     fn flush(&mut self) -> Result<(), diesel::result::Error> {
         use crate::schema::metrics::dsl::metrics;
-        // trace!("Flushing {} records", self.queue.len());
+        if self.queue.is_empty() {
+            self.last_flush = Instant::now();
+            return Ok(());
+        }
+        let mut drain_buffer: Vec<NewMetric> = self.queue.drain(..).collect();
         let db = &mut self.db;
-        let queue = self.queue.drain(..);
         db.transaction::<_, diesel::result::Error, _>(|db| {
-            for rec in queue {
-                insert_into(metrics).values(&rec).execute(db)?;
-            }
+            insert_into(metrics).values(&drain_buffer).execute(db)?;
             Ok(())
         })?;
+        drain_buffer.clear();
         self.last_flush = Instant::now();
         Ok(())
     }
@@ -293,29 +295,29 @@ fn run_worker(
                         (false, false)
                     }
                     Ok(Event::IncrementCounter(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        let entry = state.counters.entry(key).or_insert(0);
+                        let key_name = key.name();
+                        let entry = state.counters.entry(key.clone()).or_insert(0);
                         let value = {
                             *entry += value;
                             *entry
                         };
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
 
                         (state.should_flush(), false)
                     }
                     Ok(Event::AbsoluteCounter(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        state.counters.insert(key, value);
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                        let key_name = key.name();
+                        state.counters.insert(key.clone(), value);
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
                         (state.should_flush(), false)
                     }
                     Ok(Event::UpdateGauge(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        let entry = state.last_values.entry(key).or_insert(0.0);
+                        let key_name = key.name();
+                        let entry = state.last_values.entry(key.clone()).or_insert(0.0);
                         let value = match value {
                             GaugeValue::Absolute(v) => {
                                 *entry = v;
@@ -330,14 +332,14 @@ fn run_worker(
                                 *entry
                             }
                         };
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
                         (state.should_flush(), false)
                     }
                     Ok(Event::UpdateHistogram(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                        let key_name = key.name();
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
 
