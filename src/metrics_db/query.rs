@@ -55,14 +55,21 @@ pub(crate) fn average_for_session(
     key_name: &str,
     session: &Session,
 ) -> Result<f64> {
-    let metrics = metrics_for_key(db, key_name, Some(session))?;
-    if metrics.is_empty() {
-        return Err(MetricsError::NoMetricsForKey(key_name.to_string()));
+    use crate::schema::metrics::dsl::*;
+    use diesel::dsl::{avg, count_star};
+
+    let metric_key = metric_key_for_name(db, key_name)?;
+    let (average, count): (Option<f64>, i64) = metrics
+        .filter(metric_key_id.eq(metric_key.id))
+        .filter(timestamp.ge(session.start_time))
+        .filter(timestamp.le(session.end_time))
+        .select((avg(value), count_star()))
+        .first(db)?;
+    if count == 0 {
+        Err(MetricsError::NoMetricsForKey(key_name.to_string()))
+    } else {
+        Ok(average.unwrap_or(0.0))
     }
-    let sum: f64 = metrics.iter().map(|m| m.value).sum();
-    let samples = metrics.len();
-    let average = sum / samples as f64;
-    Ok(average)
 }
 
 pub(crate) fn metrics_summary_for_signpost_and_keys(

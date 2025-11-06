@@ -26,6 +26,9 @@ use thiserror::Error;
 /// Max number of items allowed in worker's queue before flushing regardless of flush duration
 const FLUSH_QUEUE_LIMIT: usize = 1000;
 const BACKGROUND_CHANNEL_LIMIT: usize = 8000;
+const SQLITE_DEFAULT_MAX_VARIABLES: usize = 999;
+const METRIC_FIELDS_PER_ROW: usize = 3;
+const INSERT_BATCH_SIZE: usize = SQLITE_DEFAULT_MAX_VARIABLES / METRIC_FIELDS_PER_ROW;
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
@@ -87,6 +90,13 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
         .to_str()
         .ok_or(MetricsError::InvalidDatabasePath)?;
     let mut db = SqliteConnection::establish(url)?;
+
+    // Enable WAL mode for better concurrent access
+    sql_query("PRAGMA journal_mode=WAL;").execute(&mut db)?;
+
+    // Set busy timeout to 5 seconds to handle lock contention gracefully
+    sql_query("PRAGMA busy_timeout = 5000;").execute(&mut db)?;
+
     db.run_pending_migrations(MIGRATIONS)
         .map_err(MetricsError::MigrationError)?;
 
@@ -202,25 +212,39 @@ impl InnerState {
     }
     fn should_flush(&self) -> bool {
         if self.last_flush.elapsed() > self.flush_duration {
-            debug!("Flushing due to {}s timeout", self.flush_duration.as_secs());
+            true
+        } else if self.queue.len() >= FLUSH_QUEUE_LIMIT {
+            debug!("Flushing due to queue size ({} items)", self.queue.len());
             true
         } else {
-            self.queue.len() >= FLUSH_QUEUE_LIMIT
+            false
         }
     }
     fn flush(&mut self) -> Result<(), diesel::result::Error> {
         use crate::schema::metrics::dsl::metrics;
-        // trace!("Flushing {} records", self.queue.len());
+        if self.queue.is_empty() {
+            self.last_flush = Instant::now();
+            return Ok(());
+        }
+        let drain_buffer: Vec<NewMetric> = self.queue.drain(..).collect();
         let db = &mut self.db;
-        let queue = self.queue.drain(..);
-        db.transaction::<_, diesel::result::Error, _>(|db| {
-            for rec in queue {
-                insert_into(metrics).values(&rec).execute(db)?;
+        let transaction_result = db.transaction::<_, diesel::result::Error, _>(|db| {
+            let chunk_size = INSERT_BATCH_SIZE.max(1);
+            for chunk in drain_buffer.chunks(chunk_size) {
+                insert_into(metrics).values(chunk).execute(db)?;
             }
             Ok(())
-        })?;
-        self.last_flush = Instant::now();
-        Ok(())
+        });
+        match transaction_result {
+            Ok(()) => {
+                self.last_flush = Instant::now();
+                Ok(())
+            }
+            Err(e) => {
+                self.queue.extend(drain_buffer);
+                Err(e)
+            }
+        }
     }
     fn queue_metric(&mut self, timestamp: Duration, key: &str, value: f64) -> Result<()> {
         let metric_key_id = match self.key_ids.get(key) {
@@ -263,6 +287,9 @@ fn run_worker(
             let mut state = InnerState::new(flush_duration, db);
             info!("SQLite worker started");
             loop {
+                // Check if we need to flush based on elapsed time
+                let time_based_flush = state.last_flush.elapsed() >= flush_duration;
+
                 let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
                     Ok(Event::Stop) => {
                         info!("Stopping SQLiteExporter worker, flushing & exiting");
@@ -293,29 +320,29 @@ fn run_worker(
                         (false, false)
                     }
                     Ok(Event::IncrementCounter(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        let entry = state.counters.entry(key).or_insert(0);
+                        let key_name = key.name();
+                        let entry = state.counters.entry(key.clone()).or_insert(0);
                         let value = {
                             *entry += value;
                             *entry
                         };
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
 
                         (state.should_flush(), false)
                     }
                     Ok(Event::AbsoluteCounter(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        state.counters.insert(key, value);
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value as _) {
+                        let key_name = key.name();
+                        state.counters.insert(key.clone(), value);
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
                         (state.should_flush(), false)
                     }
                     Ok(Event::UpdateGauge(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        let entry = state.last_values.entry(key).or_insert(0.0);
+                        let key_name = key.name();
+                        let entry = state.last_values.entry(key.clone()).or_insert(0.0);
                         let value = match value {
                             GaugeValue::Absolute(v) => {
                                 *entry = v;
@@ -330,14 +357,14 @@ fn run_worker(
                                 *entry
                             }
                         };
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
                         (state.should_flush(), false)
                     }
                     Ok(Event::UpdateHistogram(timestamp, key, value)) => {
-                        let key_str = key.name().to_string();
-                        if let Err(e) = state.queue_metric(timestamp, &key_str, value) {
+                        let key_name = key.name();
+                        if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
 
@@ -382,7 +409,6 @@ fn run_worker(
                         (false, false)
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        debug!("Flushing due to {}s timeout", flush_duration.as_secs());
                         (true, false)
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -390,7 +416,12 @@ fn run_worker(
                         (true, true)
                     }
                 };
-                if should_flush {
+
+                // Flush if time-based flush is triggered OR if event-based flush is triggered
+                if time_based_flush || should_flush {
+                    if time_based_flush {
+                        debug!("Flushing due to elapsed time ({}s)", flush_duration.as_secs());
+                    }
                     if let Err(e) = state.flush() {
                         error!("Error flushing metrics: {}", e);
                     }
