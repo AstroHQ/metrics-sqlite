@@ -165,12 +165,9 @@ mod tests {
         let (mut db, _dir) = setup_test_db();
         populate_test_db(&mut db);
 
-        let results = metrics_summary_for_signpost_and_keys(
-            &mut db,
-            "app.started",
-            vec!["cpu".to_string()],
-        )
-        .unwrap();
+        let results =
+            metrics_summary_for_signpost_and_keys(&mut db, "app.started", vec!["cpu".to_string()])
+                .unwrap();
 
         // cpu average across t=500..520 (current session only): (50+60+70)/3 = 60
         assert!(

@@ -50,7 +50,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn format_timestamp(secs: f64) -> String {
-    let dt: DateTime<Local> = Local.timestamp_opt(secs as i64, ((secs.fract()) * 1_000_000_000.0) as u32).unwrap();
+    let dt: DateTime<Local> = Local
+        .timestamp_opt(secs as i64, ((secs.fract()) * 1_000_000_000.0) as u32)
+        .unwrap();
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
