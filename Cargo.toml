@@ -26,6 +26,9 @@ tokio = { version = "1.20", features = ["sync"] }
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+tempfile = "3"
 
 [features]
 default = []

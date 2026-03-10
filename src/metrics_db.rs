@@ -61,7 +61,7 @@ impl MetricsDb {
         self.sessions.clone()
     }
 
-    /// Returns a session (timestamp range) from the first occurrence of the signpost to the latest metric
+    /// Returns a session (timestamp range) from the last occurrence of the signpost to the latest metric
     pub fn session_from_signpost(&mut self, metric: &str) -> Result<Session> {
         query::session_from_signpost(&mut self.db, metric)
     }
@@ -100,6 +100,21 @@ impl MetricsDb {
             .distinct()
             .load::<String>(&mut self.db)?;
         Ok(r)
+    }
+
+    /// Returns average values for the given metric keys within the session defined by a signpost.
+    ///
+    /// Also includes `session.duration` in the results.
+    pub fn average_metrics_from_signpost(
+        &mut self,
+        signpost: &str,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        query::metrics_summary_for_signpost_and_keys(
+            &mut self.db,
+            signpost,
+            keys.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     /// Returns all metrics for given key in ascending timestamp order
