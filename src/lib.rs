@@ -117,7 +117,11 @@ fn remove_db_files(path: &Path) {
     }
 }
 
-fn try_setup_db(url: &str) -> Result<SqliteConnection> {
+fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
+    let url = path
+        .as_ref()
+        .to_str()
+        .ok_or(MetricsError::InvalidDatabasePath)?;
     let mut db = SqliteConnection::establish(url)?;
 
     // Enable WAL mode for better concurrent access
@@ -145,11 +149,10 @@ fn try_setup_db(url: &str) -> Result<SqliteConnection> {
     Ok(db)
 }
 
-fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
+/// Like `setup_db`, but if the database is malformed, removes it and retries once.
+fn setup_db_or_reset<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     let path = path.as_ref();
-    let url = path.to_str().ok_or(MetricsError::InvalidDatabasePath)?;
-
-    match try_setup_db(url) {
+    match setup_db(path) {
         Ok(db) => Ok(db),
         Err(err) if err.is_malformed_db() => {
             warn!(
@@ -157,7 +160,7 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
                 path.display()
             );
             remove_db_files(path);
-            try_setup_db(url)
+            setup_db(path)
         }
         Err(err) => Err(err),
     }
@@ -510,7 +513,7 @@ impl SqliteExporter {
         keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
-        let mut db = setup_db(path)?;
+        let mut db = setup_db_or_reset(path)?;
         Self::housekeeping(&mut db, keep_duration, None, true);
         let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
         let thread = run_worker(db, receiver, flush_interval);
