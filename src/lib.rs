@@ -16,7 +16,7 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
@@ -69,6 +69,15 @@ pub enum MetricsError {
     #[error("No metrics recorded for `{0}` in requested session")]
     NoMetricsForKey(String),
 }
+
+impl MetricsError {
+    /// Check if this error indicates a malformed/corrupt database
+    fn is_malformed_db(&self) -> bool {
+        let msg = self.to_string();
+        msg.contains("malformed") || msg.contains("not a database")
+    }
+}
+
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
@@ -84,11 +93,31 @@ pub use models::{Metric, MetricKey, NewMetric};
 
 pub(crate) const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
-    let url = path
-        .as_ref()
-        .to_str()
-        .ok_or(MetricsError::InvalidDatabasePath)?;
+#[derive(QueryableByName)]
+struct PragmaCheckResult {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    #[diesel(column_name = quick_check)]
+    result: String,
+}
+
+/// Remove database file and its WAL/SHM sidecar files
+fn remove_db_files(path: &Path) {
+    let db_path = PathBuf::from(path);
+    for suffix in &["", "-wal", "-shm"] {
+        let mut file_path = db_path.clone().into_os_string();
+        file_path.push(suffix);
+        let file_path = PathBuf::from(file_path);
+        if file_path.exists() {
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                error!("Failed to remove {}: {}", file_path.display(), e);
+            } else {
+                info!("Removed corrupt database file: {}", file_path.display());
+            }
+        }
+    }
+}
+
+fn try_setup_db(url: &str) -> Result<SqliteConnection> {
     let mut db = SqliteConnection::establish(url)?;
 
     // Enable WAL mode for better concurrent access
@@ -100,7 +129,38 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     db.run_pending_migrations(MIGRATIONS)
         .map_err(MetricsError::MigrationError)?;
 
+    // Check for corruption that may not surface until queries run
+    let check: String = sql_query("PRAGMA quick_check;")
+        .get_result::<PragmaCheckResult>(&mut db)?
+        .result;
+    if check != "ok" {
+        return Err(MetricsError::QueryError(
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                Box::new(format!("database disk image is malformed: {check}")),
+            ),
+        ));
+    }
+
     Ok(db)
+}
+
+fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
+    let path = path.as_ref();
+    let url = path.to_str().ok_or(MetricsError::InvalidDatabasePath)?;
+
+    match try_setup_db(url) {
+        Ok(db) => Ok(db),
+        Err(err) if err.is_malformed_db() => {
+            warn!(
+                "Database is malformed, removing and recreating: {}",
+                path.display()
+            );
+            remove_db_files(path);
+            try_setup_db(url)
+        }
+        Err(err) => Err(err),
+    }
 }
 enum RegisterType {
     Counter,
