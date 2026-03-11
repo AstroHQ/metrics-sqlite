@@ -73,8 +73,7 @@ pub enum MetricsError {
 impl MetricsError {
     /// Check if this error indicates a malformed/corrupt database
     fn is_malformed_db(&self) -> bool {
-        let msg = self.to_string();
-        msg.contains("malformed") || msg.contains("not a database")
+        self.to_string().contains("malformed")
     }
 }
 
