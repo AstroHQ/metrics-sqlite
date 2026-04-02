@@ -4,7 +4,7 @@ use metrics::{
     Recorder, SharedString, Unit,
 };
 use std::{
-    sync::{mpsc::SyncSender, Arc},
+    sync::{Arc, mpsc::SyncSender},
     time::SystemTime,
 };
 use tracing::error;

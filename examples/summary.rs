@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, TimeZone};
 use clap::Parser;
 use metrics_sqlite::MetricsDb;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 struct Args {

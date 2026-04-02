@@ -2,7 +2,7 @@ use metrics::{counter, gauge};
 use metrics_sqlite::SqliteExporter;
 use std::time::Duration;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn setup_metrics() {
     let exporter = SqliteExporter::new(
