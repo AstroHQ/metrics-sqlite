@@ -352,10 +352,13 @@ fn run_worker(
                 // Check if we need to flush based on elapsed time
                 let time_based_flush = state.last_flush.elapsed() >= flush_duration;
 
-                let (should_flush, should_exit) = match receiver.recv_timeout(flush_duration) {
+                let mut should_flush = false;
+                let mut should_exit = false;
+                match receiver.recv_timeout(flush_duration) {
                     Ok(Event::Stop) => {
                         info!("Stopping SQLiteExporter worker, flushing & exiting");
-                        (true, true)
+                        should_flush = true;
+                        should_exit = true;
                     }
                     Ok(Event::SetHousekeeping {
                         retention_period,
@@ -363,7 +366,6 @@ fn run_worker(
                         record_limit,
                     }) => {
                         state.set_housekeeping(retention_period, housekeeping_period, record_limit);
-                        (false, false)
                     }
                     Ok(Event::DescribeKey(_key_type, key, unit, desc)) => {
                         info!("Describing key {:?}", key);
@@ -375,11 +377,9 @@ fn run_worker(
                         ) {
                             error!("Failed to create key entry: {:?}", e);
                         }
-                        (false, false)
                     }
                     Ok(Event::RegisterKey(_key_type, _key, _handle)) => {
                         // we currently don't do anything with register...
-                        (false, false)
                     }
                     Ok(Event::IncrementCounter(timestamp, key, value)) => {
                         let key_name = key.name();
@@ -391,8 +391,7 @@ fn run_worker(
                         if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
-
-                        (state.should_flush(), false)
+                        should_flush = state.should_flush();
                     }
                     Ok(Event::AbsoluteCounter(timestamp, key, value)) => {
                         let key_name = key.name();
@@ -400,7 +399,7 @@ fn run_worker(
                         if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
                             error!("Error queueing metric: {:?}", e);
                         }
-                        (state.should_flush(), false)
+                        should_flush = state.should_flush();
                     }
                     Ok(Event::UpdateGauge(timestamp, key, value)) => {
                         let key_name = key.name();
@@ -422,15 +421,14 @@ fn run_worker(
                         if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
-                        (state.should_flush(), false)
+                        should_flush = state.should_flush();
                     }
                     Ok(Event::UpdateHistogram(timestamp, key, value)) => {
                         let key_name = key.name();
                         if let Err(e) = state.queue_metric(timestamp, key_name, value) {
                             error!("Error queueing metric: {:?}", e);
                         }
-
-                        (state.should_flush(), false)
+                        should_flush = state.should_flush();
                     }
                     Ok(Event::RequestSummaryFromSignpost {
                         signpost_key,
@@ -468,16 +466,16 @@ fn run_worker(
                                 }
                             }
                         }
-                        (false, false)
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        (true, false)
+                        should_flush = true;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         warn!("SQLiteExporter channel disconnected, exiting worker");
-                        (true, true)
+                        should_flush = true;
+                        should_exit = true;
                     }
-                };
+                }
 
                 // Flush if time-based flush is triggered OR if event-based flush is triggered
                 if time_based_flush || should_flush {
