@@ -585,11 +585,11 @@ impl SqliteExporter {
                         let excess = records - record_limit + (record_limit / 4); // delete excess + 25% of limit
                         trace!(
                             "Exceeded limit! {} > {}, deleting {} oldest",
-                            records,
-                            record_limit,
-                            excess
+                            records, record_limit, excess
                         );
-                        let query = format!("DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {excess});");
+                        let query = format!(
+                            "DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {excess});"
+                        );
                         if let Err(e) = sql_query(query).execute(db) {
                             error!("Failed to delete excessive records: {:?}", e);
                         }

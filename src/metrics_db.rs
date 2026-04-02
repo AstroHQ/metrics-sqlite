@@ -1,7 +1,8 @@
 //! Metrics DB, to use/query/etc metrics SQLite databases
 use super::{
+    MetricsError, Result,
     models::{Metric, MetricKey},
-    setup_db, MetricsError, Result,
+    setup_db,
 };
 use diesel::prelude::*;
 #[cfg(feature = "import_csv")]
@@ -205,7 +206,7 @@ impl MetricsDb {
                     error!("Skipping record due to error reading CSV record: {:?}", e);
                 }
             }
-            if flush_counter.is_multiple_of(200) {
+            if flush_counter % 200 == 0 {
                 trace!("Flushing");
                 inner.flush()?;
             }
