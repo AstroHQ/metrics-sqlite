@@ -914,6 +914,7 @@ mod tests {
 
     #[test]
     fn reconnect_drops_queue_when_database_is_recreated() {
+        use crate::setup_db;
         use diesel::connection::SimpleConnection;
         use std::io::{Seek, SeekFrom, Write};
         let (mut state, _dir) = test_state();
@@ -930,6 +931,13 @@ mod tests {
             .db
             .batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("setup: wal checkpoint");
+        // Release the real DB's file handle before we corrupt and reset. On
+        // Windows the malformed-reset path can't `DeleteFile` a file that
+        // still has an open handle, so without this swap the reset silently
+        // fails and the queue never gets cleared (unlike POSIX, where unlink
+        // works through open handles). The in-memory placeholder just keeps
+        // `InnerState` in a valid shape until `reconnect` replaces it.
+        state.db = setup_db(":memory:").expect("setup: in-memory placeholder");
         // Keep a valid SQLite header (first 100 bytes) but overwrite a later
         // page so the next `PRAGMA quick_check` trips the malformed path. We
         // overwrite a long enough region to clobber whichever page holds the
@@ -942,6 +950,7 @@ mod tests {
             .expect("setup: seek past header");
         f.write_all(&[0xffu8; 16 * 1024])
             .expect("setup: write garbage pages");
+        f.sync_all().expect("setup: sync garbage to disk");
         drop(f);
 
         state.reconnect();
