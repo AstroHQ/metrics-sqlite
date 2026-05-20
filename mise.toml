@@ -1,0 +1,9 @@
+[tasks.precommit]
+run = [
+    "cargo clippy --all-targets -- -D clippy::uninlined_format_args",
+    "cargo fmt",
+    "cargo test --all"
+]
+
+[tasks.clippy-fix]
+run = "cargo clippy --all-targets --fix --allow-dirty -- -D clippy::uninlined_format_args"

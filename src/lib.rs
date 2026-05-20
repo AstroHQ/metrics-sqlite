@@ -13,7 +13,7 @@ use diesel::{insert_into, sql_query};
 use metrics::{GaugeValue, Key, KeyName, SetRecorderError, SharedString, Unit};
 
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -29,6 +29,59 @@ const BACKGROUND_CHANNEL_LIMIT: usize = 8000;
 const SQLITE_DEFAULT_MAX_VARIABLES: usize = 999;
 const METRIC_FIELDS_PER_ROW: usize = 3;
 const INSERT_BATCH_SIZE: usize = SQLITE_DEFAULT_MAX_VARIABLES / METRIC_FIELDS_PER_ROW;
+/// Hard cap on metrics buffered in memory by the worker. If flushing to SQLite
+/// keeps failing, the oldest metrics beyond this limit are dropped so a broken
+/// database can never grow the queue without bound.
+const QUEUE_HARD_LIMIT: usize = 100_000;
+/// Number of consecutive failed flushes after which the worker rebuilds its
+/// database connection, even if the error didn't look connection-fatal.
+const RECONNECT_AFTER_FAILURES: u64 = 3;
+/// Minimum delay between worker database reconnection attempts.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Minimum delay between repeated error log lines of the same kind.
+const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limiter for repetitive error logs. Emits at most one log per interval
+/// and reports how many were suppressed in between.
+struct LogThrottle {
+    interval: Duration,
+    last_logged: Option<Instant>,
+    suppressed: u64,
+}
+impl LogThrottle {
+    const fn new(interval: Duration) -> Self {
+        LogThrottle {
+            interval,
+            last_logged: None,
+            suppressed: 0,
+        }
+    }
+    /// Returns `Some(suppressed_since_last_log)` when a log line should be
+    /// emitted now, or `None` when it should be suppressed.
+    fn allow(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        let due = match self.last_logged {
+            Some(last) => now.duration_since(last) >= self.interval,
+            None => true,
+        };
+        if due {
+            self.last_logged = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed += 1;
+            None
+        }
+    }
+
+    /// Invokes `emit` with the count of previously-suppressed lines, but only
+    /// if enough time has passed since the last emission. Otherwise the call
+    /// is silently dropped and the suppression counter is incremented.
+    fn log_if_due(&mut self, emit: impl FnOnce(u64)) {
+        if let Some(suppressed) = self.allow() {
+            emit(suppressed);
+        }
+    }
+}
 
 /// Error type for any db/vitals related errors
 #[derive(Debug, Error)]
@@ -86,7 +139,6 @@ mod recorder;
 mod schema;
 
 use crate::metrics_db::query;
-use crate::recorder::Handle;
 pub use metrics_db::{MetricsDb, Session};
 pub use models::{Metric, MetricKey, NewMetric};
 
@@ -148,18 +200,21 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     Ok(db)
 }
 
-/// Like `setup_db`, but if the database is malformed, removes it and retries once.
-fn setup_db_or_reset<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
+/// Like `setup_db`, but if the database is malformed, removes it and retries
+/// once. The boolean in the success result is `true` when a reset actually
+/// happened, so callers can drop any cached state that referenced the old
+/// database (notably `metric_keys` row ids).
+fn setup_db_or_reset<P: AsRef<Path>>(path: P) -> Result<(SqliteConnection, bool)> {
     let path = path.as_ref();
     match setup_db(path) {
-        Ok(db) => Ok(db),
+        Ok(db) => Ok((db, false)),
         Err(err) if err.is_malformed_db() => {
             warn!(
                 "Database is malformed, removing and recreating: {}",
                 path.display()
             );
             remove_db_files(path);
-            setup_db(path)
+            setup_db(path).map(|db| (db, true))
         }
         Err(err) => Err(err),
     }
@@ -173,7 +228,6 @@ enum RegisterType {
 enum Event {
     Stop,
     DescribeKey(RegisterType, KeyName, Option<Unit>, SharedString),
-    RegisterKey(RegisterType, Key, Arc<Handle>),
     IncrementCounter(Duration, Key, u64),
     AbsoluteCounter(Duration, Key, u64),
     UpdateGauge(Duration, Key, GaugeValue),
@@ -220,9 +274,11 @@ impl SqliteExporterHandle {
 pub struct SqliteExporter {
     thread: Option<JoinHandle<()>>,
     sender: SyncSender<Event>,
+    send_error_throttle: Mutex<LogThrottle>,
 }
 struct InnerState {
     db: SqliteConnection,
+    db_path: PathBuf,
     last_housekeeping: Instant,
     housekeeping: Option<Duration>,
     retention: Option<Duration>,
@@ -233,11 +289,14 @@ struct InnerState {
     counters: HashMap<Key, u64>,
     key_ids: HashMap<String, i64>,
     queue: VecDeque<NewMetric>,
+    consecutive_flush_failures: u64,
+    last_reconnect: Option<Instant>,
 }
 impl InnerState {
-    fn new(flush_duration: Duration, db: SqliteConnection) -> Self {
+    fn new(flush_duration: Duration, db: SqliteConnection, db_path: PathBuf) -> Self {
         InnerState {
             db,
+            db_path,
             last_housekeeping: Instant::now(),
             housekeeping: None,
             retention: None,
@@ -248,6 +307,8 @@ impl InnerState {
             counters: HashMap::new(),
             key_ids: HashMap::new(),
             queue: VecDeque::with_capacity(FLUSH_QUEUE_LIMIT),
+            consecutive_flush_failures: 0,
+            last_reconnect: None,
         }
     }
     fn set_housekeeping(
@@ -283,28 +344,117 @@ impl InnerState {
         }
     }
     fn flush(&mut self) -> Result<(), diesel::result::Error> {
-        use crate::schema::metrics::dsl::metrics;
         if self.queue.is_empty() {
             self.last_flush = Instant::now();
             return Ok(());
         }
-        let drain_buffer: Vec<NewMetric> = self.queue.drain(..).collect();
-        let db = &mut self.db;
-        let transaction_result = db.transaction::<_, diesel::result::Error, _>(|db| {
-            let chunk_size = INSERT_BATCH_SIZE.max(1);
-            for chunk in drain_buffer.chunks(chunk_size) {
-                insert_into(metrics).values(chunk).execute(db)?;
-            }
-            Ok(())
-        });
-        match transaction_result {
+        // Operate on the queue in-place: pass the deque's two backing slices
+        // directly to the insert. On failure we leave the queue alone, so a
+        // broken database stays at zero memcpy cost per attempt — the cascade
+        // that filled the channel in the original incident is what made each
+        // failed flush O(queue_size) by draining and re-extending.
+        let (front, back) = self.queue.as_slices();
+        match Self::insert_metrics(&mut self.db, [front, back]) {
             Ok(()) => {
+                self.queue.clear();
                 self.last_flush = Instant::now();
+                self.consecutive_flush_failures = 0;
                 Ok(())
             }
             Err(e) => {
-                self.queue.extend(drain_buffer);
+                self.consecutive_flush_failures += 1;
+                // Queue is intact; just cap memory.
+                self.enforce_queue_cap();
+                // A broken transaction manager never heals on its own, so the
+                // connection has to be rebuilt; also rebuild after repeated
+                // failures of any kind as a backstop.
+                if Self::is_connection_fatal(&e)
+                    || self.consecutive_flush_failures >= RECONNECT_AFTER_FAILURES
+                {
+                    self.reconnect();
+                }
                 Err(e)
+            }
+        }
+    }
+
+    /// Inserts every metric in a single transaction, batched to stay under
+    /// SQLite's bound-variable limit. Accepts multiple slices so a `VecDeque`
+    /// can be inserted in-place without copying into a contiguous buffer.
+    fn insert_metrics<'a, S>(
+        db: &mut SqliteConnection,
+        slabs: S,
+    ) -> Result<(), diesel::result::Error>
+    where
+        S: IntoIterator<Item = &'a [NewMetric]>,
+    {
+        use crate::schema::metrics::dsl::metrics;
+        db.transaction::<_, diesel::result::Error, _>(|db| {
+            let chunk_size = INSERT_BATCH_SIZE.max(1);
+            for slab in slabs {
+                for chunk in slab.chunks(chunk_size) {
+                    insert_into(metrics).values(chunk).execute(db)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Drops the oldest queued metrics if the queue has grown past its hard
+    /// limit, so a database that stays unreachable can't exhaust memory.
+    fn enforce_queue_cap(&mut self) {
+        if self.queue.len() > QUEUE_HARD_LIMIT {
+            let overflow = self.queue.len() - QUEUE_HARD_LIMIT;
+            self.queue.drain(..overflow);
+            warn!(
+                "metrics-sqlite queue exceeded {} items while flushing kept failing, dropped {} oldest metrics",
+                QUEUE_HARD_LIMIT, overflow
+            );
+        }
+    }
+
+    /// True for errors that leave the connection permanently unusable, where
+    /// the only recovery is to rebuild it.
+    fn is_connection_fatal(e: &diesel::result::Error) -> bool {
+        matches!(e, diesel::result::Error::BrokenTransactionManager)
+    }
+
+    /// Rebuilds the SQLite connection after a fatal error, subject to a backoff
+    /// so a permanently broken database can't cause a reconnect storm.
+    fn reconnect(&mut self) {
+        if let Some(last) = self.last_reconnect {
+            if last.elapsed() < RECONNECT_BACKOFF {
+                return;
+            }
+        }
+        self.last_reconnect = Some(Instant::now());
+        warn!(
+            "metrics-sqlite database connection is broken, reconnecting to {}",
+            self.db_path.display()
+        );
+        match setup_db_or_reset(&self.db_path) {
+            Ok((db, was_reset)) => {
+                self.db = db;
+                // Cached key ids may be stale if the database was recreated.
+                self.key_ids.clear();
+                self.consecutive_flush_failures = 0;
+                if was_reset {
+                    // The database was malformed and recreated, so any rows we
+                    // had queued reference `metric_key_id` values from the old
+                    // `metric_keys` table. Inserting them now would orphan or
+                    // misattribute them in the join, so drop the queue.
+                    let dropped = self.queue.len();
+                    if dropped > 0 {
+                        warn!(
+                            "metrics-sqlite database was recreated; dropping {dropped} queued metrics with stale key ids"
+                        );
+                        self.queue.clear();
+                    }
+                }
+                info!("metrics-sqlite database connection re-established");
+            }
+            Err(e) => {
+                error!("metrics-sqlite failed to reconnect to database: {:?}", e);
             }
         }
     }
@@ -340,13 +490,16 @@ impl InnerState {
 
 fn run_worker(
     db: SqliteConnection,
+    db_path: PathBuf,
     receiver: Receiver<Event>,
     flush_duration: Duration,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("metrics-sqlite: worker".to_string())
         .spawn(move || {
-            let mut state = InnerState::new(flush_duration, db);
+            let mut state = InnerState::new(flush_duration, db, db_path);
+            let mut flush_error_throttle = LogThrottle::new(ERROR_LOG_INTERVAL);
+            let mut queue_error_throttle = LogThrottle::new(ERROR_LOG_INTERVAL);
             info!("SQLite worker started");
             loop {
                 // Check if we need to flush based on elapsed time
@@ -378,9 +531,6 @@ fn run_worker(
                             error!("Failed to create key entry: {:?}", e);
                         }
                     }
-                    Ok(Event::RegisterKey(_key_type, _key, _handle)) => {
-                        // we currently don't do anything with register...
-                    }
                     Ok(Event::IncrementCounter(timestamp, key, value)) => {
                         let key_name = key.name();
                         let entry = state.counters.entry(key.clone()).or_insert(0);
@@ -389,7 +539,18 @@ fn run_worker(
                             *entry
                         };
                         if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
-                            error!("Error queueing metric: {:?}", e);
+                            queue_error_throttle.log_if_due(|suppressed| {
+                                if suppressed > 0 {
+                                    error!(
+                                        "Error queueing metric: {:?} ({} similar errors suppressed in the last {}s)",
+                                        e,
+                                        suppressed,
+                                        ERROR_LOG_INTERVAL.as_secs()
+                                    );
+                                } else {
+                                    error!("Error queueing metric: {:?}", e);
+                                }
+                            });
                         }
                         should_flush = state.should_flush();
                     }
@@ -397,7 +558,18 @@ fn run_worker(
                         let key_name = key.name();
                         state.counters.insert(key.clone(), value);
                         if let Err(e) = state.queue_metric(timestamp, key_name, value as _) {
-                            error!("Error queueing metric: {:?}", e);
+                            queue_error_throttle.log_if_due(|suppressed| {
+                                if suppressed > 0 {
+                                    error!(
+                                        "Error queueing metric: {:?} ({} similar errors suppressed in the last {}s)",
+                                        e,
+                                        suppressed,
+                                        ERROR_LOG_INTERVAL.as_secs()
+                                    );
+                                } else {
+                                    error!("Error queueing metric: {:?}", e);
+                                }
+                            });
                         }
                         should_flush = state.should_flush();
                     }
@@ -419,14 +591,36 @@ fn run_worker(
                             }
                         };
                         if let Err(e) = state.queue_metric(timestamp, key_name, value) {
-                            error!("Error queueing metric: {:?}", e);
+                            queue_error_throttle.log_if_due(|suppressed| {
+                                if suppressed > 0 {
+                                    error!(
+                                        "Error queueing metric: {:?} ({} similar errors suppressed in the last {}s)",
+                                        e,
+                                        suppressed,
+                                        ERROR_LOG_INTERVAL.as_secs()
+                                    );
+                                } else {
+                                    error!("Error queueing metric: {:?}", e);
+                                }
+                            });
                         }
                         should_flush = state.should_flush();
                     }
                     Ok(Event::UpdateHistogram(timestamp, key, value)) => {
                         let key_name = key.name();
                         if let Err(e) = state.queue_metric(timestamp, key_name, value) {
-                            error!("Error queueing metric: {:?}", e);
+                            queue_error_throttle.log_if_due(|suppressed| {
+                                if suppressed > 0 {
+                                    error!(
+                                        "Error queueing metric: {:?} ({} similar errors suppressed in the last {}s)",
+                                        e,
+                                        suppressed,
+                                        ERROR_LOG_INTERVAL.as_secs()
+                                    );
+                                } else {
+                                    error!("Error queueing metric: {:?}", e);
+                                }
+                            });
                         }
                         should_flush = state.should_flush();
                     }
@@ -483,7 +677,18 @@ fn run_worker(
                         debug!("Flushing due to elapsed time ({}s)", flush_duration.as_secs());
                     }
                     if let Err(e) = state.flush() {
-                        error!("Error flushing metrics: {}", e);
+                        if let Some(suppressed) = flush_error_throttle.allow() {
+                            if suppressed > 0 {
+                                error!(
+                                    "Error flushing metrics: {} ({} similar errors suppressed in the last {}s)",
+                                    e,
+                                    suppressed,
+                                    ERROR_LOG_INTERVAL.as_secs()
+                                );
+                            } else {
+                                error!("Error flushing metrics: {}", e);
+                            }
+                        }
                     }
                 }
                 if state.should_housekeep() {
@@ -510,13 +715,15 @@ impl SqliteExporter {
         keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
-        let mut db = setup_db_or_reset(path)?;
+        let path = path.as_ref().to_path_buf();
+        let (mut db, _was_reset) = setup_db_or_reset(&path)?;
         Self::housekeeping(&mut db, keep_duration, None, true);
         let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
-        let thread = run_worker(db, receiver, flush_interval);
+        let thread = run_worker(db, path, receiver, flush_interval);
         let exporter = SqliteExporter {
             thread: Some(thread),
             sender,
+            send_error_throttle: Mutex::new(LogThrottle::new(ERROR_LOG_INTERVAL)),
         };
         Ok(exporter)
     }
@@ -602,6 +809,29 @@ impl SqliteExporter {
         }
     }
 
+    /// Logs a failure to hand an event to the worker, rate-limited so that a
+    /// full channel (sustained backpressure) can't flood the logs.
+    fn log_send_failure(&self, context: &str, err: &dyn std::fmt::Debug) {
+        if let Ok(mut throttle) = self.send_error_throttle.lock() {
+            if let Some(suppressed) = throttle.allow() {
+                if suppressed > 0 {
+                    error!(
+                        "Error sending metric {} to SQLite worker: {:?} ({} similar errors suppressed in the last {}s)",
+                        context,
+                        err,
+                        suppressed,
+                        ERROR_LOG_INTERVAL.as_secs()
+                    );
+                } else {
+                    error!(
+                        "Error sending metric {} to SQLite worker: {:?}",
+                        context, err
+                    );
+                }
+            }
+        }
+    }
+
     /// Install recorder as `metrics` crate's Recorder
     pub fn install(self) -> Result<SqliteExporterHandle, SetRecorderError<Self>> {
         let handle = SqliteExporterHandle {
@@ -620,8 +850,159 @@ impl Drop for SqliteExporter {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteExporter;
+    use crate::{
+        InnerState, LogThrottle, NewMetric, QUEUE_HARD_LIMIT, SqliteExporter, setup_db_or_reset,
+    };
     use std::time::{Duration, Instant};
+
+    fn test_state() -> (InnerState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let (db, _was_reset) = setup_db_or_reset(&path).unwrap();
+        (InnerState::new(Duration::from_secs(5), db, path), dir)
+    }
+
+    #[test]
+    fn enforce_queue_cap_drops_oldest_when_over_limit() {
+        let (mut state, _dir) = test_state();
+        // Queue more than the hard limit; values are tagged 0..N so we can tell
+        // which survived.
+        let total = QUEUE_HARD_LIMIT + 250;
+        for i in 0..total {
+            state.queue.push_back(NewMetric {
+                timestamp: 0.0,
+                metric_key_id: 1,
+                value: i as f64,
+            });
+        }
+        state.enforce_queue_cap();
+        // Queue is clamped to the limit and it's the oldest that were dropped.
+        assert_eq!(state.queue.len(), QUEUE_HARD_LIMIT);
+        assert_eq!(state.queue.front().unwrap().value, 250.0);
+        assert_eq!(state.queue.back().unwrap().value, (total - 1) as f64);
+        // A queue at or under the limit is left untouched.
+        state.enforce_queue_cap();
+        assert_eq!(state.queue.len(), QUEUE_HARD_LIMIT);
+    }
+
+    #[test]
+    fn failed_flush_leaves_queue_intact() {
+        use diesel::connection::SimpleConnection;
+        let (mut state, _dir) = test_state();
+        // Drop the metrics table so every insert in the next flush fails. We
+        // do this from the test, not via a production API, to keep the test
+        // hook out of the public crate surface.
+        state
+            .db
+            .batch_execute("DROP TABLE metrics")
+            .expect("setup: drop metrics table");
+        for i in 0..5_000 {
+            state.queue.push_back(NewMetric {
+                timestamp: 0.0,
+                metric_key_id: 1,
+                value: i as f64,
+            });
+        }
+        let before = state.queue.len();
+        assert!(state.flush().is_err(), "flush should fail");
+        // The whole point of the in-place flush: the queue is intact.
+        assert_eq!(state.queue.len(), before);
+        assert_eq!(state.queue.front().unwrap().value, 0.0);
+        assert_eq!(state.queue.back().unwrap().value, 4_999.0);
+        assert_eq!(state.consecutive_flush_failures, 1);
+    }
+
+    #[test]
+    fn reconnect_drops_queue_when_database_is_recreated() {
+        use crate::setup_db;
+        use diesel::connection::SimpleConnection;
+        use std::io::{Seek, SeekFrom, Write};
+        let (mut state, _dir) = test_state();
+        for i in 0..100 {
+            state.queue.push_back(NewMetric {
+                timestamp: 0.0,
+                metric_key_id: 1,
+                value: i as f64,
+            });
+        }
+        // Force pending writes into the main DB file and truncate the WAL so
+        // the corruption below isn't masked by WAL contents.
+        state
+            .db
+            .batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("setup: wal checkpoint");
+        // Release the real DB's file handle before we corrupt and reset. On
+        // Windows the malformed-reset path can't `DeleteFile` a file that
+        // still has an open handle, so without this swap the reset silently
+        // fails and the queue never gets cleared (unlike POSIX, where unlink
+        // works through open handles). The in-memory placeholder just keeps
+        // `InnerState` in a valid shape until `reconnect` replaces it.
+        state.db = setup_db(":memory:").expect("setup: in-memory placeholder");
+        // Keep a valid SQLite header (first 100 bytes) but overwrite a later
+        // page so the next `PRAGMA quick_check` trips the malformed path. We
+        // overwrite a long enough region to clobber whichever page holds the
+        // schema, regardless of page size.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&state.db_path)
+            .expect("setup: open db file");
+        f.seek(SeekFrom::Start(100))
+            .expect("setup: seek past header");
+        f.write_all(&[0xffu8; 16 * 1024])
+            .expect("setup: write garbage pages");
+        f.sync_all().expect("setup: sync garbage to disk");
+        drop(f);
+
+        state.reconnect();
+
+        // Reset happened: the rebuilt DB has fresh `metric_keys` ids, so the
+        // queued rows must be dropped to avoid orphaning them.
+        assert!(
+            state.queue.is_empty(),
+            "queue should be cleared after reset"
+        );
+        assert_eq!(state.consecutive_flush_failures, 0);
+        // And the new connection is usable.
+        assert!(state.flush().is_ok());
+    }
+
+    #[test]
+    fn reconnect_rebuilds_connection_with_backoff() {
+        let (mut state, _dir) = test_state();
+        state.consecutive_flush_failures = 5;
+        state.reconnect();
+        // A successful reconnect clears the failure counter and records when it
+        // happened.
+        assert_eq!(state.consecutive_flush_failures, 0);
+        let first_attempt = state.last_reconnect.expect("reconnect should run");
+        // The rebuilt connection is usable.
+        assert!(state.flush().is_ok());
+
+        // A second reconnect right away is suppressed by the backoff, so it
+        // neither re-attempts nor touches state.
+        state.consecutive_flush_failures = 5;
+        state.reconnect();
+        assert_eq!(state.consecutive_flush_failures, 5);
+        assert_eq!(state.last_reconnect, Some(first_attempt));
+    }
+
+    #[test]
+    fn log_throttle_suppresses_and_reports_count() {
+        let mut throttle = LogThrottle::new(Duration::from_millis(50));
+        // First call is always allowed, with nothing suppressed yet.
+        assert_eq!(throttle.allow(), Some(0));
+        // Rapid follow-ups are suppressed.
+        for _ in 0..7 {
+            assert_eq!(throttle.allow(), None);
+        }
+        // Once the interval elapses, the next call is allowed and reports how
+        // many were suppressed in between.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(throttle.allow(), Some(7));
+        // Counter resets after reporting.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(throttle.allow(), Some(0));
+    }
 
     #[test]
     fn test_threading() {

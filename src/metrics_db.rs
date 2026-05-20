@@ -179,9 +179,10 @@ impl MetricsDb {
     pub fn import_from_csv<S: AsRef<Path>, D: AsRef<Path>>(path: S, destination: D) -> Result<()> {
         use crate::InnerState;
         use csv::ReaderBuilder;
-        let db = setup_db(destination)?;
+        let destination = destination.as_ref().to_path_buf();
+        let db = setup_db(&destination)?;
         let mut reader = ReaderBuilder::new().from_path(path)?;
-        let mut inner = InnerState::new(Duration::from_secs(5), db);
+        let mut inner = InnerState::new(Duration::from_secs(5), db, destination);
         let header = reader.headers()?.to_owned();
         let mut flush_counter = 0u64;
         for record in reader.records() {
