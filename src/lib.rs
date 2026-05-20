@@ -200,18 +200,21 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
     Ok(db)
 }
 
-/// Like `setup_db`, but if the database is malformed, removes it and retries once.
-fn setup_db_or_reset<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
+/// Like `setup_db`, but if the database is malformed, removes it and retries
+/// once. The boolean in the success result is `true` when a reset actually
+/// happened, so callers can drop any cached state that referenced the old
+/// database (notably `metric_keys` row ids).
+fn setup_db_or_reset<P: AsRef<Path>>(path: P) -> Result<(SqliteConnection, bool)> {
     let path = path.as_ref();
     match setup_db(path) {
-        Ok(db) => Ok(db),
+        Ok(db) => Ok((db, false)),
         Err(err) if err.is_malformed_db() => {
             warn!(
                 "Database is malformed, removing and recreating: {}",
                 path.display()
             );
             remove_db_files(path);
-            setup_db(path)
+            setup_db(path).map(|db| (db, true))
         }
         Err(err) => Err(err),
     }
@@ -430,11 +433,24 @@ impl InnerState {
             self.db_path.display()
         );
         match setup_db_or_reset(&self.db_path) {
-            Ok(db) => {
+            Ok((db, was_reset)) => {
                 self.db = db;
                 // Cached key ids may be stale if the database was recreated.
                 self.key_ids.clear();
                 self.consecutive_flush_failures = 0;
+                if was_reset {
+                    // The database was malformed and recreated, so any rows we
+                    // had queued reference `metric_key_id` values from the old
+                    // `metric_keys` table. Inserting them now would orphan or
+                    // misattribute them in the join, so drop the queue.
+                    let dropped = self.queue.len();
+                    if dropped > 0 {
+                        warn!(
+                            "metrics-sqlite database was recreated; dropping {dropped} queued metrics with stale key ids"
+                        );
+                        self.queue.clear();
+                    }
+                }
                 info!("metrics-sqlite database connection re-established");
             }
             Err(e) => {
@@ -700,7 +716,7 @@ impl SqliteExporter {
         path: P,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut db = setup_db_or_reset(&path)?;
+        let (mut db, _was_reset) = setup_db_or_reset(&path)?;
         Self::housekeeping(&mut db, keep_duration, None, true);
         let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
         let thread = run_worker(db, path, receiver, flush_interval);
@@ -842,7 +858,7 @@ mod tests {
     fn test_state() -> (InnerState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metrics.db");
-        let db = setup_db_or_reset(&path).unwrap();
+        let (db, _was_reset) = setup_db_or_reset(&path).unwrap();
         (InnerState::new(Duration::from_secs(5), db, path), dir)
     }
 
@@ -894,6 +910,47 @@ mod tests {
         assert_eq!(state.queue.front().unwrap().value, 0.0);
         assert_eq!(state.queue.back().unwrap().value, 4_999.0);
         assert_eq!(state.consecutive_flush_failures, 1);
+    }
+
+    #[test]
+    fn reconnect_drops_queue_when_database_is_recreated() {
+        use diesel::connection::SimpleConnection;
+        use std::io::{Seek, SeekFrom, Write};
+        let (mut state, _dir) = test_state();
+        for i in 0..100 {
+            state.queue.push_back(NewMetric {
+                timestamp: 0.0,
+                metric_key_id: 1,
+                value: i as f64,
+            });
+        }
+        // Force pending writes into the main DB file and truncate the WAL so
+        // the corruption below isn't masked by WAL contents.
+        state
+            .db
+            .batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("setup: wal checkpoint");
+        // Keep a valid SQLite header (first 100 bytes) but overwrite a later
+        // page so the next `PRAGMA quick_check` trips the malformed path. We
+        // overwrite a long enough region to clobber whichever page holds the
+        // schema, regardless of page size.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&state.db_path)
+            .expect("setup: open db file");
+        f.seek(SeekFrom::Start(100)).expect("setup: seek past header");
+        f.write_all(&[0xffu8; 16 * 1024])
+            .expect("setup: write garbage pages");
+        drop(f);
+
+        state.reconnect();
+
+        // Reset happened: the rebuilt DB has fresh `metric_keys` ids, so the
+        // queued rows must be dropped to avoid orphaning them.
+        assert!(state.queue.is_empty(), "queue should be cleared after reset");
+        assert_eq!(state.consecutive_flush_failures, 0);
+        // And the new connection is usable.
+        assert!(state.flush().is_ok());
     }
 
     #[test]
