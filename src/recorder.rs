@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, mpsc::SyncSender},
     time::SystemTime,
 };
+#[cfg(feature = "log_dropped_metrics")]
 use tracing::error;
 
 pub(crate) struct Handle {
@@ -154,7 +155,7 @@ impl Recorder for SqliteExporter {
             unit,
             description,
         )) {
-            error!("Error sending metric description: {:?}", e);
+            self.log_send_failure("description", &e);
         }
     }
 
@@ -165,7 +166,7 @@ impl Recorder for SqliteExporter {
             unit,
             description,
         )) {
-            error!("Error sending metric description: {:?}", e);
+            self.log_send_failure("description", &e);
         }
     }
 
@@ -176,56 +177,31 @@ impl Recorder for SqliteExporter {
             unit,
             description,
         )) {
-            error!("Error sending metric description: {:?}", e);
+            self.log_send_failure("description", &e);
         }
     }
 
-    // in future we could record these to the SQLite database for informational/metadata usage
+    // Registration doesn't touch the worker channel: the previous implementation
+    // sent a `RegisterKey` event that the worker ignored, which under load
+    // produced the dominant share of "TrySendError::Full" spam.
     fn register_counter(&self, key: &Key, _metadata: &Metadata) -> Counter {
-        let sender = self.sender.clone();
-        let handle = Arc::new(Handle {
-            sender,
+        Counter::from_arc(Arc::new(Handle {
+            sender: self.sender.clone(),
             key: key.clone(),
-        });
-        if let Err(e) = self.sender.try_send(Event::RegisterKey(
-            RegisterType::Counter,
-            key.clone(),
-            handle.clone(),
-        )) {
-            error!("Error sending metric registration: {:?}", e);
-        }
-        Counter::from_arc(handle)
+        }))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata) -> Gauge {
-        let sender = self.sender.clone();
-        let handle = Arc::new(Handle {
-            sender,
+        Gauge::from_arc(Arc::new(Handle {
+            sender: self.sender.clone(),
             key: key.clone(),
-        });
-        if let Err(e) = self.sender.try_send(Event::RegisterKey(
-            RegisterType::Gauge,
-            key.clone(),
-            handle.clone(),
-        )) {
-            error!("Error sending metric registration: {:?}", e);
-        }
-        Gauge::from_arc(handle)
+        }))
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata) -> Histogram {
-        let sender = self.sender.clone();
-        let handle = Arc::new(Handle {
-            sender,
+        Histogram::from_arc(Arc::new(Handle {
+            sender: self.sender.clone(),
             key: key.clone(),
-        });
-        if let Err(e) = self.sender.try_send(Event::RegisterKey(
-            RegisterType::Histogram,
-            key.clone(),
-            handle.clone(),
-        )) {
-            error!("Error sending metric registration: {:?}", e);
-        }
-        Histogram::from_arc(handle)
+        }))
     }
 }
