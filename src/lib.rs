@@ -938,7 +938,8 @@ mod tests {
             .write(true)
             .open(&state.db_path)
             .expect("setup: open db file");
-        f.seek(SeekFrom::Start(100)).expect("setup: seek past header");
+        f.seek(SeekFrom::Start(100))
+            .expect("setup: seek past header");
         f.write_all(&[0xffu8; 16 * 1024])
             .expect("setup: write garbage pages");
         drop(f);
@@ -947,7 +948,10 @@ mod tests {
 
         // Reset happened: the rebuilt DB has fresh `metric_keys` ids, so the
         // queued rows must be dropped to avoid orphaning them.
-        assert!(state.queue.is_empty(), "queue should be cleared after reset");
+        assert!(
+            state.queue.is_empty(),
+            "queue should be cleared after reset"
+        );
         assert_eq!(state.consecutive_flush_failures, 0);
         // And the new connection is usable.
         assert!(state.flush().is_ok());
