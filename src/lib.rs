@@ -5,7 +5,7 @@
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use diesel::prelude::*;
 use diesel::{insert_into, sql_query};
@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -133,6 +133,7 @@ impl MetricsError {
 /// Metrics result type
 pub type Result<T, E = MetricsError> = std::result::Result<T, E>;
 
+mod maintenance;
 mod metrics_db;
 mod models;
 mod recorder;
@@ -180,6 +181,10 @@ fn setup_db<P: AsRef<Path>>(path: P) -> Result<SqliteConnection> {
 
     // Set busy timeout to 5 seconds to handle lock contention gracefully
     sql_query("PRAGMA busy_timeout = 5000;").execute(&mut db)?;
+
+    // Keep a reusable WAL around, but release oversized WALs when SQLite can
+    // reset them. This is not a hard cap while readers hold old snapshots.
+    sql_query("PRAGMA journal_size_limit = 4194304;").execute(&mut db)?;
 
     db.run_pending_migrations(MIGRATIONS)
         .map_err(MetricsError::MigrationError)?;
@@ -282,7 +287,13 @@ struct InnerState {
     last_housekeeping: Instant,
     housekeeping: Option<Duration>,
     retention: Option<Duration>,
+    default_retention: Option<Duration>,
     record_limit: Option<usize>,
+    inserted_since_housekeeping: usize,
+    maintenance: Option<maintenance::Maintenance>,
+    startup_cleanup_pending: bool,
+    last_maintenance_step: Instant,
+    last_vacuum_attempt: Option<Instant>,
     flush_duration: Duration,
     last_flush: Instant,
     last_values: HashMap<Key, f64>,
@@ -300,7 +311,13 @@ impl InnerState {
             last_housekeeping: Instant::now(),
             housekeeping: None,
             retention: None,
+            default_retention: None,
             record_limit: None,
+            inserted_since_housekeeping: 0,
+            maintenance: None,
+            startup_cleanup_pending: false,
+            last_maintenance_step: Instant::now(),
+            last_vacuum_attempt: None,
             flush_duration,
             last_flush: Instant::now(),
             last_values: HashMap::new(),
@@ -317,20 +334,59 @@ impl InnerState {
         housekeeping_duration: Option<Duration>,
         record_limit: Option<usize>,
     ) {
-        self.retention = retention;
+        self.retention = retention.or(self.default_retention);
         self.housekeeping = housekeeping_duration;
         self.last_housekeeping = Instant::now();
         self.record_limit = record_limit;
+        // Startup cleanup retains the constructor's policy. Periodic work can
+        // be cancelled or restarted with the newly configured limits.
+        if !self.startup_cleanup_pending {
+            self.maintenance = self.maintenance.as_ref().and_then(|_| {
+                housekeeping_duration
+                    .map(|_| maintenance::Maintenance::new(self.retention, self.record_limit))
+            });
+        }
+        self.inserted_since_housekeeping = 0;
     }
     fn should_housekeep(&self) -> bool {
         match self.housekeeping {
-            Some(duration) => self.last_housekeeping.elapsed() > duration,
+            Some(duration) => {
+                let row_trigger = self.record_limit.map_or(100_000, |limit| {
+                    (limit / 4).clamp(FLUSH_QUEUE_LIMIT, 100_000)
+                });
+                self.last_housekeeping.elapsed() >= duration
+                    || ((self.retention.is_some() || self.record_limit.is_some())
+                        && self.inserted_since_housekeeping >= row_trigger
+                        && self.last_housekeeping.elapsed() >= Duration::from_secs(1))
+            }
             None => false,
         }
     }
     fn housekeep(&mut self) -> Result<(), diesel::result::Error> {
-        SqliteExporter::housekeeping(&mut self.db, self.retention, self.record_limit, false);
-        self.last_housekeeping = Instant::now();
+        let result = self.housekeep_step();
+        // Include time spent waiting on SQLite and reclaiming space, even on
+        // failure, so incoming events get a full interval after slow work.
+        self.last_maintenance_step = Instant::now();
+        result
+    }
+    fn housekeep_step(&mut self) -> Result<(), diesel::result::Error> {
+        if self.maintenance.is_none() {
+            self.maintenance = Some(maintenance::Maintenance::new(
+                self.retention,
+                self.record_limit,
+            ));
+            self.last_housekeeping = Instant::now();
+            self.inserted_since_housekeeping = 0;
+        }
+        if self.maintenance.as_mut().unwrap().step(&mut self.db)? {
+            self.maintenance = None;
+            self.startup_cleanup_pending = false;
+            let reclaim = maintenance::reclaim(&mut self.db, &mut self.last_vacuum_attempt);
+            // Completed deletes deserve a checkpoint even if VACUUM fails.
+            let checkpoint = maintenance::checkpoint(&mut self.db);
+            reclaim?;
+            checkpoint?;
+        }
         Ok(())
     }
     fn should_flush(&self) -> bool {
@@ -356,6 +412,9 @@ impl InnerState {
         let (front, back) = self.queue.as_slices();
         match Self::insert_metrics(&mut self.db, [front, back]) {
             Ok(()) => {
+                self.inserted_since_housekeeping = self
+                    .inserted_since_housekeeping
+                    .saturating_add(self.queue.len());
                 self.queue.clear();
                 self.last_flush = Instant::now();
                 self.consecutive_flush_failures = 0;
@@ -493,11 +552,18 @@ fn run_worker(
     db_path: PathBuf,
     receiver: Receiver<Event>,
     flush_duration: Duration,
+    keep_duration: Option<Duration>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("metrics-sqlite: worker".to_string())
         .spawn(move || {
             let mut state = InnerState::new(flush_duration, db, db_path);
+            state.default_retention = keep_duration;
+            state.retention = keep_duration;
+            if keep_duration.is_some() {
+                state.maintenance = Some(maintenance::Maintenance::new(keep_duration, None));
+                state.startup_cleanup_pending = true;
+            }
             let mut flush_error_throttle = LogThrottle::new(ERROR_LOG_INTERVAL);
             let mut queue_error_throttle = LogThrottle::new(ERROR_LOG_INTERVAL);
             info!("SQLite worker started");
@@ -507,7 +573,12 @@ fn run_worker(
 
                 let mut should_flush = false;
                 let mut should_exit = false;
-                match receiver.recv_timeout(flush_duration) {
+                let wait = if state.maintenance.is_some() {
+                    flush_duration.min(maintenance::STEP_INTERVAL)
+                } else {
+                    flush_duration
+                };
+                match receiver.recv_timeout(wait) {
                     Ok(Event::Stop) => {
                         info!("Stopping SQLiteExporter worker, flushing & exiting");
                         should_flush = true;
@@ -662,7 +733,7 @@ fn run_worker(
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        should_flush = true;
+                        should_flush = state.should_flush();
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         warn!("SQLiteExporter channel disconnected, exiting worker");
@@ -691,13 +762,20 @@ fn run_worker(
                         }
                     }
                 }
-                if state.should_housekeep() {
+                if should_exit {
+                    let _ = maintenance::checkpoint(&mut state.db);
+                    break;
+                }
+                if (state.maintenance.is_some() || state.should_housekeep())
+                    && state.last_maintenance_step.elapsed() >= maintenance::STEP_INTERVAL
+                {
                     if let Err(e) = state.housekeep() {
                         error!("Failed running house keeping: {:?}", e);
+                        state.maintenance = None;
+                        state.startup_cleanup_pending = false;
+                        state.last_housekeeping = Instant::now();
+                        state.inserted_since_housekeeping = 0;
                     }
-                }
-                if should_exit {
-                    break;
                 }
             }
         })
@@ -709,17 +787,18 @@ impl SqliteExporter {
     ///
     /// `flush_interval` specifies how often metrics are flushed to SQLite/disk
     ///
-    /// `keep_duration` specifies how long data is kept before deleting, performed new()
+    /// `keep_duration` specifies how long data is kept. Initial cleanup runs on
+    /// the worker, and supplies the default retention for periodic housekeeping.
+    /// Opening, migration, and the integrity check still run on the caller.
     pub fn new<P: AsRef<Path>>(
         flush_interval: Duration,
         keep_duration: Option<Duration>,
         path: P,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let (mut db, _was_reset) = setup_db_or_reset(&path)?;
-        Self::housekeeping(&mut db, keep_duration, None, true);
+        let (db, _was_reset) = setup_db_or_reset(&path)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(BACKGROUND_CHANNEL_LIMIT);
-        let thread = run_worker(db, path, receiver, flush_interval);
+        let thread = run_worker(db, path, receiver, flush_interval, keep_duration);
         let exporter = SqliteExporter {
             thread: Some(thread),
             sender,
@@ -731,7 +810,14 @@ impl SqliteExporter {
     /// Sets optional periodic housekeeping, None to disable (disabled by default)
     /// ## Notes
     /// Periodic housekeeping can affect metric recording, causing some data to be dropped during housekeeping.
-    /// Record limit if set will cause anything over limit + 25% of the limit to be removed
+    /// Exceeding the record limit removes the excess plus 25% of the limit.
+    /// `retention: None` uses the `keep_duration` supplied to `new()`.
+    /// With housekeeping enabled, successful inserts also trigger cleanup after
+    /// 1,000–100,000 rows (scaled to the record limit), at most once per second.
+    /// Deletes run in batches between events. Large amounts of free space may
+    /// trigger a full VACUUM on the worker, with attempts at most once per hour.
+    /// Disabling periodic housekeeping cancels its pending batches. Startup
+    /// cleanup continues independently using the constructor's retention policy.
     pub fn set_periodic_housekeeping(
         &self,
         periodic_duration: Option<Duration>,
@@ -744,68 +830,6 @@ impl SqliteExporter {
             record_limit,
         }) {
             error!("Failed to set house keeping settings: {:?}", e);
-        }
-    }
-
-    /// Run housekeeping.
-    ///
-    /// Does nothing if None was given for keep_duration in `new()`
-    fn housekeeping(
-        db: &mut SqliteConnection,
-        keep_duration: Option<Duration>,
-        record_limit: Option<usize>,
-        vacuum: bool,
-    ) {
-        use crate::schema::metrics::dsl::*;
-        use diesel::dsl::count;
-        if let Some(keep_duration) = keep_duration {
-            match SystemTime::UNIX_EPOCH.elapsed() {
-                Ok(now) => {
-                    let cutoff = now - keep_duration;
-                    trace!("Deleting data {}s old", keep_duration.as_secs());
-                    if let Err(e) =
-                        diesel::delete(metrics.filter(timestamp.le(cutoff.as_secs_f64())))
-                            .execute(db)
-                    {
-                        error!("Failed to remove old metrics data: {}", e);
-                    }
-                    if vacuum {
-                        if let Err(e) = sql_query("VACUUM").execute(db) {
-                            error!("Failed to vacuum SQLite DB: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "System time error, skipping metrics-sqlite housekeeping: {}",
-                        e
-                    );
-                }
-            }
-        }
-        if let Some(record_limit) = record_limit {
-            trace!("Checking for records over {} limit", record_limit);
-            match metrics.select(count(id)).first::<i64>(db) {
-                Ok(records) => {
-                    let records = records as usize;
-                    if records > record_limit {
-                        let excess = records - record_limit + (record_limit / 4); // delete excess + 25% of limit
-                        trace!(
-                            "Exceeded limit! {} > {}, deleting {} oldest",
-                            records, record_limit, excess
-                        );
-                        let query = format!(
-                            "DELETE FROM metrics WHERE id IN (SELECT id FROM metrics ORDER BY timestamp ASC LIMIT {excess});"
-                        );
-                        if let Err(e) = sql_query(query).execute(db) {
-                            error!("Failed to delete excessive records: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get record count: {:?}", e);
-                }
-            }
         }
     }
 
@@ -863,6 +887,194 @@ mod tests {
     }
 
     #[test]
+    fn configuring_housekeeping_preserves_pending_startup_cleanup() {
+        let (mut state, _dir) = test_state();
+        state.default_retention = Some(Duration::from_secs(60));
+        state.startup_cleanup_pending = true;
+        state.maintenance = Some(crate::maintenance::Maintenance::new(
+            state.default_retention,
+            None,
+        ));
+        state.queue_metric(Duration::ZERO, "old", 1.0).unwrap();
+        state.flush().unwrap();
+        state.set_housekeeping(None, Some(Duration::from_secs(1800)), None);
+        assert!(state.maintenance.is_some());
+        while state.maintenance.is_some() {
+            state.housekeep().unwrap();
+        }
+        use diesel::prelude::*;
+        assert_eq!(
+            crate::schema::metrics::table
+                .count()
+                .get_result::<i64>(&mut state.db)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn disabling_periodic_cleanup_cancels_remaining_batches() {
+        let (mut state, _dir) = test_state();
+        for _ in 0..2500 {
+            state.queue_metric(Duration::ZERO, "old", 1.0).unwrap();
+        }
+        state.flush().unwrap();
+        state.set_housekeeping(
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(1)),
+            None,
+        );
+        state.housekeep().unwrap();
+        assert!(state.maintenance.is_some());
+        state.set_housekeeping(Some(Duration::from_secs(60)), None, None);
+        assert!(state.maintenance.is_none());
+        assert!(!state.should_housekeep());
+        use diesel::prelude::*;
+        assert_eq!(
+            crate::schema::metrics::table
+                .count()
+                .get_result::<i64>(&mut state.db)
+                .unwrap(),
+            1500
+        );
+    }
+
+    #[test]
+    fn disabling_periodic_cleanup_preserves_startup_policy() {
+        let (mut state, _dir) = test_state();
+        state.default_retention = Some(Duration::from_secs(60));
+        state.startup_cleanup_pending = true;
+        state.maintenance = Some(crate::maintenance::Maintenance::new(
+            state.default_retention,
+            None,
+        ));
+        state.queue_metric(Duration::ZERO, "old", 1.0).unwrap();
+        state
+            .queue_metric(
+                std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap(),
+                "recent",
+                1.0,
+            )
+            .unwrap();
+        state.flush().unwrap();
+        // Even a zero record limit must not replace the startup retention policy.
+        state.set_housekeeping(None, None, Some(0));
+        while state.maintenance.is_some() {
+            state.housekeep().unwrap();
+        }
+        assert!(!state.startup_cleanup_pending);
+        assert!(!state.should_housekeep());
+        use diesel::prelude::*;
+        assert_eq!(
+            crate::schema::metrics::table
+                .count()
+                .get_result::<i64>(&mut state.db)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn maintenance_interval_starts_after_sqlite_lock_wait() {
+        use diesel::{prelude::*, sql_query};
+        let (mut state, _dir) = test_state();
+        state.queue_metric(Duration::ZERO, "old", 1.0).unwrap();
+        state.flush().unwrap();
+        state.set_housekeeping(
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(1)),
+            None,
+        );
+        let mut blocker = crate::setup_db(&state.db_path).unwrap();
+        sql_query("BEGIN IMMEDIATE").execute(&mut blocker).unwrap();
+        let unlocker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let released = Instant::now();
+            sql_query("COMMIT").execute(&mut blocker).unwrap();
+            released
+        });
+        state.housekeep().unwrap();
+        let released = unlocker.join().unwrap();
+        assert!(
+            state.last_maintenance_step >= released,
+            "the interval must start after waiting for SQLite, not before"
+        );
+    }
+
+    #[test]
+    fn failed_vacuum_is_throttled_and_does_not_skip_checkpoint() {
+        use diesel::{prelude::*, sql_query};
+        let (mut state, _dir) = test_state();
+        sql_query("CREATE TABLE ballast (data BLOB)")
+            .execute(&mut state.db)
+            .unwrap();
+        sql_query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1100) INSERT INTO ballast SELECT zeroblob(65536) FROM n")
+            .execute(&mut state.db).unwrap();
+        sql_query("DELETE FROM ballast")
+            .execute(&mut state.db)
+            .unwrap();
+        let wal = state.db_path.with_file_name("metrics.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        // Reject VACUUM writes, while allowing checkpointing of committed work.
+        sql_query("PRAGMA query_only = ON")
+            .execute(&mut state.db)
+            .unwrap();
+        assert!(state.housekeep().is_err());
+        let attempt = state
+            .last_vacuum_attempt
+            .expect("failed VACUUM records its attempt");
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            0,
+            "checkpoint must run even when reclamation fails"
+        );
+        state.housekeep().unwrap();
+        assert_eq!(state.last_vacuum_attempt, Some(attempt));
+        state.last_vacuum_attempt = Some(Instant::now() - crate::maintenance::VACUUM_INTERVAL);
+        assert!(
+            state.housekeep().is_err(),
+            "retry after the cooldown expires"
+        );
+        assert!(state.last_vacuum_attempt.unwrap() > attempt);
+    }
+
+    #[test]
+    fn housekeeping_inherits_retention_and_counts_only_successful_writes() {
+        let (mut state, _dir) = test_state();
+        let default = Duration::from_secs(60);
+        state.default_retention = Some(default);
+        state.set_housekeeping(None, Some(Duration::from_secs(1800)), Some(1000));
+        assert_eq!(state.retention, Some(default));
+        state.last_housekeeping = Instant::now() - Duration::from_secs(2);
+        for _ in 0..1000 {
+            state.queue_metric(Duration::ZERO, "test", 1.0).unwrap();
+        }
+        assert!(!state.should_housekeep());
+        state.flush().unwrap();
+        assert!(state.should_housekeep());
+        state.housekeep().unwrap();
+        while state.maintenance.is_some() {
+            state.housekeep().unwrap();
+        }
+        use diesel::prelude::*;
+        assert_eq!(
+            crate::schema::metrics::table
+                .count()
+                .get_result::<i64>(&mut state.db)
+                .unwrap(),
+            0
+        );
+        assert!(!state.should_housekeep());
+        state.set_housekeeping(Some(Duration::from_secs(120)), None, Some(1000));
+        assert_eq!(state.retention, Some(Duration::from_secs(120)));
+        state.inserted_since_housekeeping = 100_000;
+        assert!(
+            !state.should_housekeep(),
+            "disabled housekeeping ignores row trigger"
+        );
+    }
+
+    #[test]
     fn enforce_queue_cap_drops_oldest_when_over_limit() {
         let (mut state, _dir) = test_state();
         // Queue more than the hard limit; values are tagged 0..N so we can tell
@@ -910,6 +1122,7 @@ mod tests {
         assert_eq!(state.queue.front().unwrap().value, 0.0);
         assert_eq!(state.queue.back().unwrap().value, 4_999.0);
         assert_eq!(state.consecutive_flush_failures, 1);
+        assert_eq!(state.inserted_since_housekeeping, 0);
     }
 
     #[test]
@@ -1007,22 +1220,30 @@ mod tests {
     #[test]
     fn test_threading() {
         use std::thread;
-        SqliteExporter::new(Duration::from_millis(500), None, "metrics.db")
-            .unwrap()
-            .install()
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = std::sync::Arc::new(
+            SqliteExporter::new(
+                Duration::from_millis(500),
+                None,
+                dir.path().join("metrics.db"),
+            )
+            .unwrap(),
+        );
         let joins: Vec<thread::JoinHandle<()>> = (0..5)
             .map(|_| {
+                let exporter = exporter.clone();
                 thread::spawn(move || {
-                    let start = Instant::now();
-                    loop {
-                        metrics::gauge!("rate").set(1.0);
-                        metrics::counter!("hits").increment(1);
-                        metrics::histogram!("histogram").record(5.0);
-                        if start.elapsed().as_secs() >= 5 {
-                            break;
+                    metrics::with_local_recorder(exporter.as_ref(), || {
+                        let start = Instant::now();
+                        loop {
+                            metrics::gauge!("rate").set(1.0);
+                            metrics::counter!("hits").increment(1);
+                            metrics::histogram!("histogram").record(5.0);
+                            if start.elapsed().as_secs() >= 5 {
+                                break;
+                            }
                         }
-                    }
+                    });
                 })
             })
             .collect();
