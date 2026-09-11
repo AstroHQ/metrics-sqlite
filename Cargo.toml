@@ -1,12 +1,12 @@
 [package]
 name = "metrics-sqlite"
-version = "0.6.1"
+version = "0.7.0"
 authors = ["Jeremy Knope <jeremy@astropad.com>"]
 description = "Library for providing SQLite backend for metrics"
 keywords = ["metrics", "sqlite"]
 categories = ["development-tools::debugging"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/metrics-sqlite"
